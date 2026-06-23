@@ -67,3 +67,4 @@ def dispatch_gesture(captured_frame, norm_points, gesture_name: str) -> np.ndarr
 from . import search_find_info  # noqa: E402, F401
 from . import ask     # noqa: E402, F401
 from . import translate  # noqa: E402, F401
+from . import anchor  # noqa: E402, F401

@@ -24,7 +24,6 @@ from .. import (
     config,
     geometry,
     network,
-    object_db,
     render,
     segmentation,
 )
@@ -53,60 +52,11 @@ def _persist(crop_bgr, target_meta, match_meta, payload):
     print(f"[SEARCH] saved -> {base}.json")
 
 
-def _resolve_match(crop_bgr):
-    """Run CLIP and return (object_dict_or_None, match_meta).
-    object_dict is None when we should treat this as a gesture fail.
-    """
-    db = object_db.get_db()
-    if db is None or db.embedding_matrix is None or len(db.embedding_matrix) == 0:
-        return None, {"status": "db_empty"}
-    if not clip_matcher.is_ready():
-        return None, {"status": "clip_unavailable"}
-
-    try:
-        query_emb = clip_matcher.embed_image(crop_bgr)
-    except Exception as exc:
-        print(f"[SEARCH][ERROR] embed failed: {exc}")
-        return None, {"status": "embed_error", "error": str(exc)}
-
-    match = clip_matcher.match_against_db(query_emb, db)
-    if match is None:
-        return None, {"status": "no_candidates"}
-
-    ranking = [(oid, float(s)) for oid, s in match["ranking"]]
-    score = float(match["score"])
-    if score < config.CLIP_MATCH_MIN_SCORE:
-        return None, {
-            "status": "below_threshold",
-            "score": score,
-            "ranking": ranking,
-            "threshold": float(config.CLIP_MATCH_MIN_SCORE),
-        }
-
-    obj = match["object"]
-    return obj, {
-        "status": "matched",
-        "object_id": obj["id"],
-        "score": score,
-        "ranking": ranking,
-        "threshold": float(config.CLIP_MATCH_MIN_SCORE),
-    }
-
-
 def _match_worker(crop_bgr, target_meta, gesture_name):
-    matched_obj, match_meta = _resolve_match(crop_bgr)
+    matched_obj, match_meta = clip_matcher.resolve_db_match(crop_bgr)
 
     if matched_obj is None:
-        reason = {
-            "db_empty": "Object DB is empty -- add reference images.",
-            "clip_unavailable": "CLIP model is not loaded.",
-            "embed_error": "CLIP embedding failed.",
-            "no_candidates": "No reference embeddings available.",
-            "below_threshold": (
-                f"Below CLIP threshold "
-                f"({match_meta.get('score', 0.0):.2f} < {config.CLIP_MATCH_MIN_SCORE:.2f})."
-            ),
-        }.get(match_meta["status"], "Object not recognised.")
+        reason = clip_matcher.fail_reason_for(match_meta["status"], match_meta)
 
         fail_payload = {
             "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3],

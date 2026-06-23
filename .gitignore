@@ -11,8 +11,5 @@ __pycache__/
 # Auto-generated VLM/CLIP run logs
 vlm_outputs/
 
-# Large model weights -- pull them in manually, don't ship in git
-sam2.1_hiera_tiny.pt
-
 # CLIP embedding cache (regenerated on first run from object_db/images/)
 object_db/embeddings.npz
