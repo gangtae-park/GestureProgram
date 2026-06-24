@@ -114,6 +114,9 @@ def pick_best_overlap(gaze_bbox, candidates):
     """Score every candidate dict (with 'bbox') against gaze_bbox, return
     (best_index, best_overlap, best_iou). Candidates with overlap below
     config.TARGET_MIN_OVERLAP are skipped entirely.
+
+    Legacy bbox-vs-bbox targeting. Object handlers now prefer the Gaussian
+    field + mask path below; this is kept for non-object callers.
     """
     best_idx = -1
     best_score = -1.0
@@ -131,3 +134,130 @@ def pick_best_overlap(gaze_bbox, candidates):
             best_overlap = overlap
             best_iou = iou
     return best_idx, best_overlap, best_iou
+
+
+# =========================================================================
+# Gaze Gaussian field  +  mask soft-IoU targeting
+# =========================================================================
+# The gaze trail is turned into a soft 2D field (a fuzzy union of Gaussian
+# circles centred on each gaze point). A YOLO object is scored by the soft IoU
+# between this field and the object's segmentation MASK -- i.e. against the
+# object's real outline, not its bounding box. Because the field decays away
+# from where the user actually looked, the empty gap between two separated
+# objects contributes almost nothing, which is what Compare needs.
+
+
+def build_gaze_gaussian_field(pixel_points, frame_shape, sigma_px=None):
+    """Return an HxW float32 gaze field in [0, 1].
+
+    Each gaze sample paints a Gaussian blob and the blobs are ACCUMULATED
+    (summed), so this is a fixation/dwell heatmap: places the user dwelled on
+    (many overlapping samples) build up high weight, while a brief saccade
+    grazing across the gap deposits very little. The result is normalised by
+    its peak so values land in [0, 1] and the soft IoU against an object mask
+    stays comparable in scale. Each blob is only evaluated inside a
+    +/-TRUNCATE*sigma window for speed.
+    """
+    h, w = frame_shape[:2]
+    field = np.zeros((h, w), dtype=np.float32)
+    if not pixel_points:
+        return field
+
+    if sigma_px is None:
+        sigma_px = max(config.GAZE_GAUSSIAN_MIN_SIGMA_PX,
+                       config.GAZE_GAUSSIAN_SIGMA_FRAC * min(h, w))
+    sigma = float(sigma_px)
+    if sigma <= 0:
+        return field
+    inv_2s2 = 1.0 / (2.0 * sigma * sigma)
+    radius = int(np.ceil(config.GAZE_GAUSSIAN_TRUNCATE * sigma))
+
+    for px, py in pixel_points:
+        x0 = max(0, px - radius); x1 = min(w, px + radius + 1)
+        y0 = max(0, py - radius); y1 = min(h, py + radius + 1)
+        if x0 >= x1 or y0 >= y1:
+            continue
+        dx = np.arange(x0, x1, dtype=np.float32) - px
+        dy = np.arange(y0, y1, dtype=np.float32) - py
+        blob = np.exp(-(np.outer(dy * dy, np.ones_like(dx))
+                        + np.outer(np.ones_like(dy), dx * dx)) * inv_2s2)
+        field[y0:y1, x0:x1] += blob
+
+    peak = float(field.max())
+    if peak > 0:
+        field /= peak
+    return field
+
+
+def _candidate_mask(candidate, frame_shape):
+    """Boolean HxW mask for a YOLO candidate: its segmentation mask when
+    available, otherwise a filled rectangle from its bbox (so box-only
+    detections still participate)."""
+    mask = candidate.get("mask_bool")
+    if mask is not None:
+        return mask
+    h, w = frame_shape[:2]
+    rect = np.zeros((h, w), dtype=bool)
+    x1, y1, x2, y2 = candidate["bbox"]
+    x1 = max(0, int(x1)); y1 = max(0, int(y1))
+    x2 = min(w, int(x2)); y2 = min(h, int(y2))
+    if x2 > x1 and y2 > y1:
+        rect[y1:y2, x1:x2] = True
+    return rect
+
+
+def gaussian_mask_iou(gaze_field, mask_bool):
+    """Soft IoU (fuzzy Jaccard) between the gaze field (values 0..1) and a
+    binary mask:  inter = sum(field over mask),  union = mask_area + field_sum
+    - inter."""
+    inter = float(gaze_field[mask_bool].sum())
+    field_sum = float(gaze_field.sum())
+    mask_area = float(np.count_nonzero(mask_bool))
+    union = mask_area + field_sum - inter
+    return inter / union if union > 0 else 0.0
+
+
+def gaussian_mask_overlap(gaze_field, mask_bool):
+    """Fraction of total gaze weight that falls on the mask. Used as the
+    inclusion gate (cheap, scale-free)."""
+    field_sum = float(gaze_field.sum())
+    if field_sum <= 0:
+        return 0.0
+    return float(gaze_field[mask_bool].sum()) / field_sum
+
+
+def _score_candidates_by_mask(gaze_field, candidates, frame_shape):
+    """Yield (index, overlap, iou) for every candidate clearing the overlap
+    gate, scored against the gaze field via its mask."""
+    scored = []
+    for i, c in enumerate(candidates):
+        mask = _candidate_mask(c, frame_shape)
+        overlap = gaussian_mask_overlap(gaze_field, mask)
+        if overlap < config.TARGET_MIN_OVERLAP:
+            continue
+        iou = gaussian_mask_iou(gaze_field, mask)
+        scored.append((i, overlap, iou))
+    return scored
+
+
+def pick_best_mask_target(gaze_field, candidates, frame_shape):
+    """Single best object for the gaze field. Returns (best_index, overlap,
+    iou); (-1, 0, 0) when nothing clears the gate. Mirrors pick_best_overlap's
+    overlap-gate + IoU-weighted score, but on masks instead of boxes."""
+    best_idx, best_score, best_overlap, best_iou = -1, -1.0, 0.0, 0.0
+    for i, overlap, iou in _score_candidates_by_mask(gaze_field, candidates, frame_shape):
+        score = (1 - config.TARGET_SCORE_IOU_WEIGHT) * overlap + config.TARGET_SCORE_IOU_WEIGHT * iou
+        if score > best_score:
+            best_score, best_idx, best_overlap, best_iou = score, i, overlap, iou
+    return best_idx, best_overlap, best_iou
+
+
+def pick_top_mask_targets(gaze_field, candidates, frame_shape, top_n=None):
+    """Top-N distinct objects by soft IoU, for Compare-style multi-targeting.
+    Returns a list of (index, overlap, iou) sorted by IoU desc (highest first),
+    each clearing config.TARGET_MIN_OVERLAP."""
+    if top_n is None:
+        top_n = config.TARGET_MULTI_TOP_N
+    scored = _score_candidates_by_mask(gaze_field, candidates, frame_shape)
+    scored.sort(key=lambda t: t[2], reverse=True)
+    return scored[:top_n]
