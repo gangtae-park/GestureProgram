@@ -57,23 +57,6 @@ COMPARE_TOP_N = 2
 COMPARE_TARGET_COLORS = [(0, 255, 0), (0, 165, 255)]   # BGR: #1 green, #2 orange
 
 
-# =================== Gaze Gaussian field (object targeting) ===================
-# Object targeting no longer uses a rectangular gaze bbox. Instead the gaze
-# trail becomes a soft field: each gaze point contributes a Gaussian blob and the
-# blobs are accumulated into a dwell/fixation heatmap (then peak-normalised to
-# [0,1]). Empty space between two separated objects stays near zero, and a brief
-# saccade grazing across the gap barely registers, so targeting two distant
-# objects (e.g. Compare) is not polluted by the gap a bounding box would include.
-#
-# A YOLO object is scored by the *soft IoU* (fuzzy Jaccard) between this field
-# and the object's segmentation mask, not its box.
-GAZE_GAUSSIAN_SIGMA_FRAC = 0.04          # blob std as a fraction of min(frame_h, frame_w)
-GAZE_GAUSSIAN_MIN_SIGMA_PX = 12          # floor for the std on small frames
-GAZE_GAUSSIAN_TRUNCATE = 3.0             # evaluate each blob within +/- this many std
-GAZE_FIELD_HEATMAP_ALPHA = 0.6           # render: heatmap blend strength (0..1)
-TARGET_MULTI_TOP_N = 2                   # how many objects Compare-style targeting returns
-
-
 # =================== Calibration (gaze_dir -> norm_xy) ===================
 RIDGE_MODEL_PATH = "calibration_ridge_model.json"
 

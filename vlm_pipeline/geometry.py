@@ -114,9 +114,6 @@ def pick_best_overlap(gaze_bbox, candidates):
     """Score every candidate dict (with 'bbox') against gaze_bbox, return
     (best_index, best_overlap, best_iou). Candidates with overlap below
     config.TARGET_MIN_OVERLAP are skipped entirely.
-
-    Legacy bbox-vs-bbox targeting. Object handlers now prefer the Gaussian
-    field + mask path below; this is kept for non-object callers.
     """
     best_idx = -1
     best_score = -1.0

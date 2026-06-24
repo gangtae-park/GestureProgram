@@ -99,8 +99,9 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
         return render.placeholder_canvas("No frame at gesture END")
 
     pixel_points = geometry.project_norm_points(norm_points, captured_frame.shape)
+    gaze_bbox = geometry.compute_gaze_bbox(pixel_points, captured_frame.shape)
 
-    if len(pixel_points) < config.MIN_GAZE_POINTS_FOR_TARGET:
+    if gaze_bbox is None:
         empty = render.render_target_overlay(
             captured_frame, pixel_points, None, None, "NONE", [], gesture_name
         )
@@ -110,20 +111,13 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
         )
         return empty
 
-    # Gaze -> soft Gaussian field (union of per-point blobs). gaze_bbox is kept
-    # only for logging / crop fallbacks; targeting uses the field vs the mask.
-    gaze_field = geometry.build_gaze_gaussian_field(pixel_points, captured_frame.shape)
-    gaze_bbox = geometry.compute_gaze_bbox(pixel_points, captured_frame.shape)
-
-    # ---- YOLO segment selection (gaze field vs object mask, soft IoU) ----
+    # ---- YOLO segment selection ----
     yolo_items = segmentation.run_yolo(captured_frame)
     target = None
     target_source = "NONE"
 
     if yolo_items:
-        idx, overlap, iou = geometry.pick_best_mask_target(
-            gaze_field, yolo_items, captured_frame.shape
-        )
+        idx, overlap, iou = geometry.pick_best_overlap(gaze_bbox, yolo_items)
         if idx >= 0 and overlap > 0:
             chosen = dict(yolo_items[idx])
             chosen["best_overlap"] = overlap
@@ -137,7 +131,7 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
             )
 
     overlay = render.render_target_overlay(
-        captured_frame, pixel_points, gaze_field,
+        captured_frame, pixel_points, gaze_bbox,
         target, target_source, yolo_items, gesture_name,
     )
 
@@ -167,8 +161,7 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
         "best_iou": float(target.get("best_iou", 0.0)),
         "class_name": target.get("class_name"),
         "conf": float(target.get("conf", 0.0)) if "conf" in target else None,
-        "gaze_bbox": list(gaze_bbox) if gaze_bbox is not None else None,
-        "targeting": "gaze_gaussian_mask_iou",
+        "gaze_bbox": list(gaze_bbox),
         "clip_masked_crop": bool(
             config.CLIP_USE_MASKED_CROP and target.get("mask_bool") is not None
         ),
