@@ -83,8 +83,8 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
     print(f"[Translate][OCR] detected {len(ocr_blocks)} paragraph blocks")
 
     overlay = render.render_target_overlay(
-        captured_frame, pixel_points, gaze_bbox,
-        None, "NONE", [], gesture_name,
+        captured_frame, pixel_points, None,
+        None, "NONE", [], gesture_name, gaze_bbox=gaze_bbox,
     )
     for b in ocr_blocks:
         x1, y1, x2, y2 = b["bbox"]

@@ -24,7 +24,6 @@ from .. import (
     config,
     geometry,
     network,
-    object_db,
     render,
     segmentation,
 )
@@ -53,60 +52,11 @@ def _persist(crop_bgr, target_meta, match_meta, payload):
     print(f"[SEARCH] saved -> {base}.json")
 
 
-def _resolve_match(crop_bgr):
-    """Run CLIP and return (object_dict_or_None, match_meta).
-    object_dict is None when we should treat this as a gesture fail.
-    """
-    db = object_db.get_db()
-    if db is None or db.embedding_matrix is None or len(db.embedding_matrix) == 0:
-        return None, {"status": "db_empty"}
-    if not clip_matcher.is_ready():
-        return None, {"status": "clip_unavailable"}
-
-    try:
-        query_emb = clip_matcher.embed_image(crop_bgr)
-    except Exception as exc:
-        print(f"[SEARCH][ERROR] embed failed: {exc}")
-        return None, {"status": "embed_error", "error": str(exc)}
-
-    match = clip_matcher.match_against_db(query_emb, db)
-    if match is None:
-        return None, {"status": "no_candidates"}
-
-    ranking = [(oid, float(s)) for oid, s in match["ranking"]]
-    score = float(match["score"])
-    if score < config.CLIP_MATCH_MIN_SCORE:
-        return None, {
-            "status": "below_threshold",
-            "score": score,
-            "ranking": ranking,
-            "threshold": float(config.CLIP_MATCH_MIN_SCORE),
-        }
-
-    obj = match["object"]
-    return obj, {
-        "status": "matched",
-        "object_id": obj["id"],
-        "score": score,
-        "ranking": ranking,
-        "threshold": float(config.CLIP_MATCH_MIN_SCORE),
-    }
-
-
 def _match_worker(crop_bgr, target_meta, gesture_name):
-    matched_obj, match_meta = _resolve_match(crop_bgr)
+    matched_obj, match_meta = clip_matcher.resolve_db_match(crop_bgr)
 
     if matched_obj is None:
-        reason = {
-            "db_empty": "Object DB is empty -- add reference images.",
-            "clip_unavailable": "CLIP model is not loaded.",
-            "embed_error": "CLIP embedding failed.",
-            "no_candidates": "No reference embeddings available.",
-            "below_threshold": (
-                f"Below CLIP threshold "
-                f"({match_meta.get('score', 0.0):.2f} < {config.CLIP_MATCH_MIN_SCORE:.2f})."
-            ),
-        }.get(match_meta["status"], "Object not recognised.")
+        reason = clip_matcher.fail_reason_for(match_meta["status"], match_meta)
 
         fail_payload = {
             "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3],
@@ -149,9 +99,8 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
         return render.placeholder_canvas("No frame at gesture END")
 
     pixel_points = geometry.project_norm_points(norm_points, captured_frame.shape)
-    gaze_bbox = geometry.compute_gaze_bbox(pixel_points, captured_frame.shape)
 
-    if gaze_bbox is None:
+    if len(pixel_points) < config.MIN_GAZE_POINTS_FOR_TARGET:
         empty = render.render_target_overlay(
             captured_frame, pixel_points, None, None, "NONE", [], gesture_name
         )
@@ -161,13 +110,20 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
         )
         return empty
 
-    # ---- YOLO segment selection ----
+    # Gaze -> soft Gaussian field (union of per-point blobs). gaze_bbox is kept
+    # only for logging / crop fallbacks; targeting uses the field vs the mask.
+    gaze_field = geometry.build_gaze_gaussian_field(pixel_points, captured_frame.shape)
+    gaze_bbox = geometry.compute_gaze_bbox(pixel_points, captured_frame.shape)
+
+    # ---- YOLO segment selection (gaze field vs object mask, soft IoU) ----
     yolo_items = segmentation.run_yolo(captured_frame)
     target = None
     target_source = "NONE"
 
     if yolo_items:
-        idx, overlap, iou = geometry.pick_best_overlap(gaze_bbox, yolo_items)
+        idx, overlap, iou = geometry.pick_best_mask_target(
+            gaze_field, yolo_items, captured_frame.shape
+        )
         if idx >= 0 and overlap > 0:
             chosen = dict(yolo_items[idx])
             chosen["best_overlap"] = overlap
@@ -181,7 +137,7 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
             )
 
     overlay = render.render_target_overlay(
-        captured_frame, pixel_points, gaze_bbox,
+        captured_frame, pixel_points, gaze_field,
         target, target_source, yolo_items, gesture_name,
     )
 
@@ -211,7 +167,8 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
         "best_iou": float(target.get("best_iou", 0.0)),
         "class_name": target.get("class_name"),
         "conf": float(target.get("conf", 0.0)) if "conf" in target else None,
-        "gaze_bbox": list(gaze_bbox),
+        "gaze_bbox": list(gaze_bbox) if gaze_bbox is not None else None,
+        "targeting": "gaze_gaussian_mask_iou",
         "clip_masked_crop": bool(
             config.CLIP_USE_MASKED_CROP and target.get("mask_bool") is not None
         ),
