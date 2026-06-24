@@ -16,6 +16,8 @@ latest_is_tracked = False
 is_gesture_active = False
 gesture_name_active = None
 gesture_norm_points = []        # list[(nx, ny)] inside current START..END window
+gaze_logging_frozen = False     # Compare: True after a READY marker -> stop appending gaze
+                                # (the "bring hands together" motion must not pollute the trail)
 pending_gesture_end = None      # dict {gesture_name, norm_points, ready_at}, consumed by main loop
 last_gesture_fail = None        # dict {gesture_name, reason, fail_time}, consumed by main loop
 

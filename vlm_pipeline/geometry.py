@@ -131,3 +131,23 @@ def pick_best_overlap(gaze_bbox, candidates):
             best_overlap = overlap
             best_iou = iou
     return best_idx, best_overlap, best_iou
+
+
+def pick_top_overlaps(gaze_bbox, candidates, top_n=2):
+    """Like pick_best_overlap but returns the top-N candidates instead of one,
+    for multi-object targeting (e.g. Compare needs two).
+
+    Returns a list of (index, overlap, iou) sorted by score descending. Only
+    candidates clearing config.TARGET_MIN_OVERLAP are included, so the list may
+    be shorter than top_n (or empty) when fewer objects overlap the gaze.
+    """
+    scored = []
+    for i, c in enumerate(candidates):
+        overlap = gaze_overlap_ratio(gaze_bbox, c["bbox"])
+        if overlap < config.TARGET_MIN_OVERLAP:
+            continue
+        iou = bbox_iou(gaze_bbox, c["bbox"])
+        score = (1 - config.TARGET_SCORE_IOU_WEIGHT) * overlap + config.TARGET_SCORE_IOU_WEIGHT * iou
+        scored.append((i, overlap, iou, score))
+    scored.sort(key=lambda t: t[3], reverse=True)
+    return [(i, ov, iou) for (i, ov, iou, _s) in scored[:top_n]]

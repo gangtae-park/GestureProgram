@@ -52,6 +52,10 @@ TARGET_SCORE_IOU_WEIGHT = 0.999
 TARGET_MIN_OVERLAP = 0.03
 TARGET_CROP_PAD_RATIO = 0.10             # 10% padding around target bbox for VLM crop
 
+# Compare: number of objects to target, and a distinct overlay colour per slot.
+COMPARE_TOP_N = 2
+COMPARE_TARGET_COLORS = [(0, 255, 0), (0, 165, 255)]   # BGR: #1 green, #2 orange
+
 
 # =================== Calibration (gaze_dir -> norm_xy) ===================
 RIDGE_MODEL_PATH = "calibration_ridge_model.json"
