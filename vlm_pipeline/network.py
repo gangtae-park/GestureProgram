@@ -63,6 +63,18 @@ def parse_packet(msg: str) -> dict:
             "question": ",".join(parts[3:]).strip(),
         }
 
+    if pt == "VOICE_COMMAND":
+        # Legacy fallback from Unity. New Android STT flow should prefer the
+        # /voice_command HTTP JSON request so image + transcript share a request_id.
+        if len(parts) < 4:
+            raise ValueError(f"VOICE_COMMAND expects at least 4 fields, got {len(parts)}")
+        return {
+            "type": "VOICE_COMMAND",
+            "seq": int(parts[1]),
+            "sender_time": float(parts[2]),
+            "transcript": ",".join(parts[3:]).strip(),
+        }
+
     raise ValueError(f"unknown packet type: {pt}")
 
 
@@ -223,6 +235,18 @@ def udp_receiver_loop(sock: socket.socket):
             threading.Thread(
                 target=process_ask_question,
                 args=(question,),
+                daemon=True,
+            ).start()
+
+        elif ptype == "VOICE_COMMAND":
+            transcript = pkt.get("transcript", "").strip()
+            print(
+                f"\n[VOICE_COMMAND][LEGACY] received seq={pkt['seq']} "
+                f"transcript={transcript!r}; routing through cached Ask fallback."
+            )
+            threading.Thread(
+                target=process_ask_question,
+                args=(transcript,),
                 daemon=True,
             ).start()
 

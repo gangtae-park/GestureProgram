@@ -119,3 +119,24 @@ Style:
 - If the question can't be answered from the DB or the image, say so plainly
   instead of guessing.
 """
+
+VOICE_COMMAND_PROMPT = """\
+You are answering a user's spoken question or command about what they were seeing
+in an XR headset when voice recording started. The image is that exact screen
+snapshot, and the transcript below is the recognized speech.
+
+Respond ONLY with a single JSON object using this schema:
+
+{
+  "name": "<short title for the visible target or task>",
+  "answer": "<direct answer to the transcript using the image>"
+}
+
+Style:
+- Be concise and practical.
+- If the transcript asks about a visible object, ground the answer in the image.
+- If the image or transcript is insufficient, say what is missing instead of guessing.
+
+Transcript:
+{transcript}
+"""
