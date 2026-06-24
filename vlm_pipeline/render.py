@@ -70,3 +70,43 @@ def render_target_overlay(captured_frame, pixel_points, gaze_bbox, target,
     return overlay
 
 
+def render_compare_overlay(captured_frame, pixel_points, gaze_bbox, targets,
+                            candidates, gesture_name):
+    """Compare: gaze trail/bbox + candidate boxes + up to two target objects,
+    each drawn in a distinct colour (mask tint when available) and tagged #1/#2."""
+    overlay = captured_frame.copy()
+
+    cv2.putText(
+        overlay, f"GESTURE: {gesture_name}", (20, 30),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA,
+    )
+
+    for c in candidates[:config.MAX_SEGMENTS_TO_RENDER]:
+        x1, y1, x2, y2 = c["bbox"]
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (160, 160, 160), 1)
+
+    for p in pixel_points:
+        cv2.circle(overlay, p, 3, config.TRAIL_COLOR, -1)
+
+    if gaze_bbox is not None:
+        gx1, gy1, gx2, gy2 = gaze_bbox
+        cv2.rectangle(overlay, (gx1, gy1), (gx2, gy2), config.TRAIL_COLOR, 2)
+
+    palette = config.COMPARE_TARGET_COLORS
+    for i, t in enumerate(targets):
+        color = palette[i % len(palette)]
+        tx1, ty1, tx2, ty2 = t["bbox"]
+        if t.get("mask_bool") is not None:
+            tint = np.zeros_like(overlay)
+            tint[t["mask_bool"]] = color
+            overlay = cv2.addWeighted(overlay, 1.0, tint, 0.45, 0)
+        cv2.rectangle(overlay, (tx1, ty1), (tx2, ty2), color, 3)
+        label = f"#{i + 1} {t.get('class_name', '?')} iou={t.get('best_iou', 0.0):.2f}"
+        cv2.putText(
+            overlay, label, (tx1, max(20, ty1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA,
+        )
+
+    return overlay
+
+

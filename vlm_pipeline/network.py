@@ -152,7 +152,11 @@ def udp_receiver_loop(sock: socket.socket):
             with state.gaze_lock:
                 state.latest_is_tracked = tracked
                 state.latest_gaze_norm = mapped
-                if state.is_gesture_active and mapped is not None:
+                if (
+                    state.is_gesture_active
+                    and mapped is not None
+                    and not state.gaze_logging_frozen
+                ):
                     state.gesture_norm_points.append(mapped)
 
         elif ptype == "GESTURE_EVENT":
@@ -178,9 +182,18 @@ def udp_receiver_loop(sock: socket.socket):
                     state.is_gesture_active = True
                     state.gesture_name_active = pkt["gesture_name"]
                     state.gesture_norm_points = []
+                    state.gaze_logging_frozen = False
                     print(
                         f"\n[GESTURE] START name={state.gesture_name_active} "
                         f"seq={pkt['seq']}"
+                    )
+                elif evt == "READY":
+                    # Compare arming marker: freeze the gaze trail here so the
+                    # "bring hands together" motion that follows is not logged.
+                    state.gaze_logging_frozen = True
+                    print(
+                        f"\n[GESTURE] READY name={pkt_name} "
+                        f"seq={pkt['seq']} pts_frozen={len(state.gesture_norm_points)}"
                     )
                 elif evt == "END":
                     # Prefer END's gesture_name over the START-time placeholder
@@ -200,6 +213,7 @@ def udp_receiver_loop(sock: socket.socket):
                     state.is_gesture_active = False
                     state.gesture_name_active = None
                     state.gesture_norm_points = []
+                    state.gaze_logging_frozen = False
                 elif evt == "FAIL":
                     failed_name = state.gesture_name_active or pkt.get("gesture_name")
                     print(
@@ -215,6 +229,7 @@ def udp_receiver_loop(sock: socket.socket):
                     state.is_gesture_active = False
                     state.gesture_name_active = None
                     state.gesture_norm_points = []
+                    state.gaze_logging_frozen = False
 
         elif ptype == "ASK_QUESTION":
             question = pkt.get("question", "").strip()
