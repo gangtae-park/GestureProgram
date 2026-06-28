@@ -40,3 +40,11 @@ unity_sender_sock = None        # socket.socket | None  -- created in network.in
 ask_lock = threading.Lock()
 latest_ask_target = None  # dict | None  -- {"crop", "target_meta", "gesture_name", "timestamp"}
 
+
+# ---- Translate gesture: cached OCR result waiting for the confirming swipe. ----
+# Populated by handlers/translate.do_ocr() on Translate READY; consumed by
+# handlers/translate.handle() on Translate END. Holds the OCR'd text + the
+# overlay/target_meta so the END stage only needs to run GPT translation.
+translate_lock = threading.Lock()
+latest_translate_pending = None  # dict | None -- {"text", "bbox", "gaze_bbox", "pick_mode", "pick_score", "timestamp"}
+
