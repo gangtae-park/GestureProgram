@@ -347,25 +347,48 @@ def _process_voice_command_async(payload: dict):
 
 
 def _process_object_ui_async(payload: dict, request_id: str):
-    image_bgr, image_error = _decode_image_base64(str(payload.get("image_base64") or ""))
+    # Galaxy XR's Unity ScreenCapture can only see Unity-rendered content;
+    # passthrough is composited by the OS and never reaches Unity's frame
+    # buffer. So the image Unity used to POST was effectively blank and YOLO
+    # detected nothing. Instead we run YOLO against the latest ADB-streamed
+    # frame (state.latest_frame) -- that's the same source the gesture
+    # handlers (Search/Anchor/Save/etc.) already use successfully, because
+    # the ADB screenrecord stream captures the OS-composited display.
+    with state.frame_lock:
+        image_bgr = None if state.latest_frame is None else state.latest_frame.copy()
+
     if image_bgr is None:
-        print(f"[OBJECT_UI][ERROR] capture decode failed request_id={request_id}: {image_error}")
-        _send_object_ui_result(request_id, [], payload, status="fail", reason=f"image decode failed: {image_error}")
+        reason = "no ADB stream frame yet (is adb screenrecord running?)"
+        print(f"[OBJECT_UI][ERROR] {reason} request_id={request_id}")
+        _send_object_ui_result(request_id, [], payload, status="fail", reason=reason)
         return
 
-    image_base64 = str(payload.get("image_base64") or "")
-    if "," in image_base64 and image_base64.strip().lower().startswith("data:"):
-        image_base64 = image_base64.split(",", 1)[1]
-    image_bytes = len(base64.b64decode(image_base64, validate=True))
-    print(f"[OBJECT_UI][RX] request_id={request_id} image_bytes={image_bytes}")
+    h, w = image_bgr.shape[:2]
+    print(f"[OBJECT_UI][RX] request_id={request_id} source=ADB_stream frame={w}x{h}")
+
+    # DEBUG: dump the frame YOLO sees so we can verify content + tune later.
+    try:
+        import os, cv2 as _cv2
+        os.makedirs("/tmp/object_ui_debug", exist_ok=True)
+        _path = f"/tmp/object_ui_debug/{request_id}.jpg"
+        _cv2.imwrite(_path, image_bgr)
+        print(f"[OBJECT_UI][DEBUG] saved frame -> {_path}")
+    except Exception as _e:
+        print(f"[OBJECT_UI][DEBUG] save failed: {_e}")
 
     t0 = time.perf_counter()
     detections_raw = segmentation.run_yolo(image_bgr)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     print(f"[OBJECT_UI][YOLO] detections={len(detections_raw)} request_id={request_id} elapsed_ms={elapsed_ms:.0f}")
 
+    # Override the dimension fields in the source payload so the response
+    # advertises the ADB-stream resolution (which is what bboxes are in),
+    # not whatever Unity put there.
+    payload_for_response = dict(payload)
+    payload_for_response["image_width"] = w
+    payload_for_response["image_height"] = h
+
     detections = []
-    h, w = image_bgr.shape[:2]
     for i, item in enumerate(detections_raw):
         bbox = [float(v) for v in item.get("bbox", (0, 0, 0, 0))]
         class_name = str(item.get("class_name") or item.get("class_id") or "detected_object")
@@ -378,15 +401,15 @@ def _process_object_ui_async(payload: dict, request_id: str):
             "confidence": confidence,
             "conf": confidence,
             "bbox": bbox,
-            "image_width": int(payload.get("image_width") or w),
-            "image_height": int(payload.get("image_height") or h),
-            "imageWidth": int(payload.get("image_width") or w),
-            "imageHeight": int(payload.get("image_height") or h),
+            "image_width": w,
+            "image_height": h,
+            "imageWidth": w,
+            "imageHeight": h,
         }
         detections.append(det)
         print(f"[OBJECT_UI][YOLO] det[{i}] class={class_name} conf={confidence:.3f} bbox={bbox}")
 
-    _send_object_ui_result(request_id, detections, payload)
+    _send_object_ui_result(request_id, detections, payload_for_response)
 
 
 def _send_object_ui_result(request_id: str, detections: list, source_payload: dict, status: str = "ok", reason: str = ""):
