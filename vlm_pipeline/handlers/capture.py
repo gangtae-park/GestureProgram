@@ -1,59 +1,45 @@
-"""Handler for the 'Ask' gesture (question-mark shape).
+"""Handler for the 'Capture' gesture (camera-frame hand pose, both hands).
 
-Pipeline (two phases, two Unity messages):
+Pipeline (identical to Anchor / Save -- "identify the gazed object and ack"):
+  1. Build the gaze bbox from the gesture-window gaze trail.
+  2. Run YOLO; pick the segment whose bbox best overlaps the gaze.
+  3. CLIP-embed the (optionally masked) crop and look it up in the 3-object DB.
+  4. If the match clears CLIP_MATCH_MIN_SCORE, send an ack VLM_RESULT carrying
+     just the matched object's name + id. Unity opens its Capture UI from
+     there (framing rectangle preview, etc.).
+  5. Below threshold (or no YOLO match) -> gesture fail.
 
-  PHASE 1 -- triggered by gesture END:
-    a. gaze bbox -> YOLO -> masked crop.
-    b. CLIP match against the 3-object DB.
-       * Below threshold       -> gesture fail (Unity gets fail VLM_RESULT).
-    c. Cache crop + matched object in state.latest_ask_target.
-    d. Send VLM_RESULT with stage='object_recognized' + the DB name so Unity
-       can immediately prompt the user with "I see <name>, what do you want
-       to ask?".
-
-  PHASE 2 -- triggered later, when Unity POSTs the recorded audio:
-    a. voice_server -> Whisper transcribe -> network.process_ask_question.
-    b. process_ask_question pulls the cached match + crop, calls GPT with the
-       DB info as ground truth, and sends VLM_RESULT with stage='answer'
-       carrying both the DB name and the GPT answer.
+NOTE: This intentionally targets a single object via gaze, matching Anchor/Save.
+The eventual "framing rectangle defined by both hands' L-corners + two-hand
+pinch shutter" pipeline can refine the target selection later -- when that
+lands, this handler grows a 2D ROI argument and YOLO selection is filtered
+by that ROI instead of (or in addition to) the gaze bbox.
 """
-import time
 from datetime import datetime
 
 import cv2
 import numpy as np
 
-from .. import (
-    clip_matcher,
-    config,
-    geometry,
-    network,
-    render,
-    segmentation,
-    state,
-)
+from .. import clip_matcher, config, geometry, network, render, segmentation
 from . import register
 
 
 def _fail(overlay, gesture_name, reason, target_meta, match_meta=None):
-    """Render fail overlay + tell Unity + clear the Ask cache."""
-    with state.ask_lock:
-        state.latest_ask_target = None
     cv2.putText(
-        overlay, f"ASK FAIL: {reason}",
+        overlay, f"CAPTURE FAIL: {reason}",
         (20, overlay.shape[0] - 30),
         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA,
     )
     extra = dict(target_meta or {})
     if match_meta is not None:
         extra["match_meta"] = match_meta
-    extra["stage"] = "object_recognized"
+    extra["stage"] = "ack"
     network.send_gesture_fail_to_unity(gesture_name, reason, extra)
-    print(f"[Ask] gesture fail | {reason}")
+    print(f"[Capture] gesture fail | {reason}")
     return overlay
 
 
-@register("Ask")
+@register("Capture")
 def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.ndarray:
     if captured_frame is None:
         return render.placeholder_canvas("No frame at gesture END")
@@ -69,11 +55,10 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
             empty, f"NOT ENOUGH GAZE POINTS ({len(pixel_points)})",
             (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, config.TRAIL_COLOR, 2, cv2.LINE_AA,
         )
-        with state.ask_lock:
-            state.latest_ask_target = None
+        _fail(empty, gesture_name, "Not enough gaze points for Capture.", {"gaze_bbox": None})
         return empty
 
-    # ---- YOLO segment ----
+    # ---- YOLO segment overlapping gaze ----
     yolo_items = segmentation.run_yolo(captured_frame)
     target = None
     target_source = "NONE"
@@ -87,8 +72,9 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
             target = chosen
             target_source = "YOLO"
             print(
-                f"[Ask][YOLO] target | class={chosen['class_name']} conf={chosen['conf']:.2f} "
-                f"overlap={overlap:.2f} iou={iou:.2f} bbox={chosen['bbox']}"
+                f"[Capture][YOLO] target | class={chosen['class_name']} "
+                f"conf={chosen['conf']:.2f} overlap={overlap:.2f} iou={iou:.2f} "
+                f"bbox={chosen['bbox']}"
             )
 
     overlay = render.render_target_overlay(
@@ -113,20 +99,14 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
 
     matched_obj, match_meta = clip_matcher.resolve_db_match(clip_crop)
 
-    # ---- Crop we keep for the GPT call (uses padded bbox like before) ----
-    crop_x1, crop_y1, crop_x2, crop_y2 = geometry.expand_bbox_for_crop(
-        target["bbox"], captured_frame.shape, config.TARGET_CROP_PAD_RATIO
-    )
-    crop = captured_frame[crop_y1:crop_y2, crop_x1:crop_x2].copy()
-
     target_meta = {
         "source": target_source,
         "bbox": list(target["bbox"]),
+        "frame_size": [int(captured_frame.shape[1]), int(captured_frame.shape[0])],  # [width, height]
         "best_overlap": float(target.get("best_overlap", 0.0)),
         "best_iou": float(target.get("best_iou", 0.0)),
         "class_name": target.get("class_name"),
         "conf": float(target.get("conf", 0.0)) if "conf" in target else None,
-        "crop_bbox": [crop_x1, crop_y1, crop_x2, crop_y2],
         "gaze_bbox": list(gaze_bbox),
         "clip_masked_crop": bool(
             config.CLIP_USE_MASKED_CROP and target.get("mask_bool") is not None
@@ -137,41 +117,30 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
         reason = clip_matcher.fail_reason_for(match_meta["status"], match_meta)
         return _fail(overlay, gesture_name, reason, target_meta, match_meta=match_meta)
 
-    # ---- Phase 1 success: cache + tell Unity which object was recognized ----
-    with state.ask_lock:
-        state.latest_ask_target = {
-            "crop": crop,
-            "target_meta": target_meta,
-            "match_meta": match_meta,
-            "matched_object": matched_obj,
-            "gesture_name": gesture_name,
-            "timestamp": time.time(),
-        }
-
-    recognized_payload = {
+    # ---- Success: ack Unity with just the matched object name + id ----
+    network.send_vlm_result_to_unity({
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3],
         "gesture": gesture_name,
         "model": f"YOLO+CLIP({config.CLIP_MODEL_NAME})",
         "status": "ok",
-        "stage": "object_recognized",
+        "stage": "ack",
         "target_meta": target_meta,
         "match_meta": match_meta,
         "response": {
             "name": matched_obj.get("name", ""),
             "object_id": matched_obj.get("id", ""),
+            "message": "Capture object recognised.",
         },
-    }
-    network.send_vlm_result_to_unity(recognized_payload)
+    })
 
     cv2.putText(
         overlay,
-        f"ASK: {matched_obj.get('name','?')} "
-        f"(score={match_meta['score']:.2f}) -- waiting for question.",
+        f"CAPTURE: {matched_obj.get('name','?')} (score={match_meta['score']:.2f})",
         (20, overlay.shape[0] - 30),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 220, 255), 2, cv2.LINE_AA,
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, config.TARGET_COLOR, 2, cv2.LINE_AA,
     )
     print(
-        f"[Ask] phase1 sent name={matched_obj.get('name')!r} "
-        f"(id={matched_obj['id']}, score={match_meta['score']:.3f})"
+        f"[Capture] matched id={matched_obj['id']} "
+        f"name={matched_obj.get('name')!r} score={match_meta['score']:.3f}"
     )
     return overlay

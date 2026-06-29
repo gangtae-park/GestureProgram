@@ -117,6 +117,131 @@ def prepare_query_crop(target_segment: dict, frame_bgr: np.ndarray) -> np.ndarra
             crop = np.where(mask_crop[..., None], crop, grey)
     return crop
 
+def resolve_db_match(crop_bgr):
+    """End-to-end CLIP lookup for a query crop.
+
+    Returns (object_dict | None, meta). object_dict is None whenever the
+    handler should treat the gesture as a fail (DB empty, CLIP not ready,
+    embedding errored, no candidates, or score below the threshold). meta
+    always carries a 'status' field describing which branch we took.
+    """
+    from . import object_db  # local import: object_db imports clip_matcher
+
+    db = object_db.get_db()
+    if db is None or db.embedding_matrix is None or len(db.embedding_matrix) == 0:
+        return None, {"status": "db_empty"}
+    if not is_ready():
+        return None, {"status": "clip_unavailable"}
+
+    try:
+        query_emb = embed_image(crop_bgr)
+    except Exception as exc:
+        print(f"[CLIP][ERROR] embed failed: {exc}")
+        return None, {"status": "embed_error", "error": str(exc)}
+
+    match = match_against_db(query_emb, db)
+    if match is None:
+        return None, {"status": "no_candidates"}
+
+    score = float(match["score"])
+    ranking = [(oid, float(s)) for oid, s in match["ranking"]]
+    if score < config.CLIP_MATCH_MIN_SCORE:
+        return None, {
+            "status": "below_threshold",
+            "score": score,
+            "ranking": ranking,
+            "threshold": float(config.CLIP_MATCH_MIN_SCORE),
+        }
+
+    obj = match["object"]
+    return obj, {
+        "status": "matched",
+        "object_id": obj["id"],
+        "score": score,
+        "ranking": ranking,
+        "threshold": float(config.CLIP_MATCH_MIN_SCORE),
+    }
+
+def fail_reason_for(status: str, meta: dict) -> str:
+    if status == "db_empty":
+        return "Object DB is empty -- add reference images."
+    if status == "clip_unavailable":
+        return "CLIP model is not loaded."
+    if status == "embed_error":
+        return "CLIP embedding failed."
+    if status == "no_candidates":
+        return "No reference embeddings available."
+    if status == "below_threshold":
+        return (
+            f"Below CLIP threshold "
+            f"({meta.get('score', 0.0):.2f} < {config.CLIP_MATCH_MIN_SCORE:.2f})."
+        )
+    return "Object not recognised."
+
+def resolve_db_match(crop_bgr):
+    """End-to-end CLIP lookup for a query crop.
+
+    Returns (object_dict | None, meta). object_dict is None whenever the
+    handler should treat the gesture as a fail (DB empty, CLIP not ready,
+    embedding errored, no candidates, or score below the threshold). meta
+    always carries a 'status' field describing which branch we took.
+    """
+    from . import object_db  # local import: object_db imports clip_matcher
+
+    db = object_db.get_db()
+    if db is None or db.embedding_matrix is None or len(db.embedding_matrix) == 0:
+        return None, {"status": "db_empty"}
+    if not is_ready():
+        return None, {"status": "clip_unavailable"}
+
+    try:
+        query_emb = embed_image(crop_bgr)
+    except Exception as exc:
+        print(f"[CLIP][ERROR] embed failed: {exc}")
+        return None, {"status": "embed_error", "error": str(exc)}
+
+    match = match_against_db(query_emb, db)
+    if match is None:
+        return None, {"status": "no_candidates"}
+
+    score = float(match["score"])
+    ranking = [(oid, float(s)) for oid, s in match["ranking"]]
+    if score < config.CLIP_MATCH_MIN_SCORE:
+        return None, {
+            "status": "below_threshold",
+            "score": score,
+            "ranking": ranking,
+            "threshold": float(config.CLIP_MATCH_MIN_SCORE),
+        }
+
+    obj = match["object"]
+    return obj, {
+        "status": "matched",
+        "object_id": obj["id"],
+        "score": score,
+        "ranking": ranking,
+        "threshold": float(config.CLIP_MATCH_MIN_SCORE),
+    }
+
+
+# Human-friendly fail reason text for each status enum that resolve_db_match
+# can return. Handlers reuse this so the error string Unity sees is consistent.
+def fail_reason_for(status: str, meta: dict) -> str:
+    if status == "db_empty":
+        return "Object DB is empty -- add reference images."
+    if status == "clip_unavailable":
+        return "CLIP model is not loaded."
+    if status == "embed_error":
+        return "CLIP embedding failed."
+    if status == "no_candidates":
+        return "No reference embeddings available."
+    if status == "below_threshold":
+        return (
+            f"Below CLIP threshold "
+            f"({meta.get('score', 0.0):.2f} < {config.CLIP_MATCH_MIN_SCORE:.2f})."
+        )
+    return "Object not recognised."
+
 
 def match_against_db(query_emb: np.ndarray, db) -> dict:
     """Cosine similarity match against an ObjectDB. Returns:

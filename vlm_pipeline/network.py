@@ -164,7 +164,11 @@ def udp_receiver_loop(sock: socket.socket):
             with state.gaze_lock:
                 state.latest_is_tracked = tracked
                 state.latest_gaze_norm = mapped
-                if state.is_gesture_active and mapped is not None:
+                if (
+                    state.is_gesture_active
+                    and mapped is not None
+                    and not state.gaze_logging_frozen
+                ):
                     state.gesture_norm_points.append(mapped)
 
         elif ptype == "GESTURE_EVENT":
@@ -190,10 +194,33 @@ def udp_receiver_loop(sock: socket.socket):
                     state.is_gesture_active = True
                     state.gesture_name_active = pkt["gesture_name"]
                     state.gesture_norm_points = []
+                    state.gaze_logging_frozen = False
                     print(
                         f"\n[GESTURE] START name={state.gesture_name_active} "
                         f"seq={pkt['seq']}"
                     )
+                elif evt == "READY":
+                    # Compare arming marker: freeze the gaze trail here so the
+                    # "bring hands together" motion that follows is not logged.
+                    # Translate's READY does the same gaze freeze AND triggers
+                    # stage-1 OCR via the translate handler. END (after the
+                    # confirming swipe) then runs the GPT translation.
+                    state.gaze_logging_frozen = True
+                    print(
+                        f"\n[GESTURE] READY name={pkt_name} "
+                        f"seq={pkt['seq']} pts_frozen={len(state.gesture_norm_points)}"
+                    )
+                    if pkt_name == "Translate":
+                        # Snapshot the frame + gaze trail right now, then dispatch
+                        # OCR on a background thread so the UDP loop keeps draining.
+                        with state.frame_lock:
+                            captured = None if state.latest_frame is None else state.latest_frame.copy()
+                        snapshot_points = list(state.gesture_norm_points)
+                        threading.Thread(
+                            target=_run_translate_ocr_stage,
+                            args=(captured, snapshot_points, pkt_name),
+                            daemon=True,
+                        ).start()
                 elif evt == "END":
                     # Prefer END's gesture_name over the START-time placeholder
                     # (Unity GestureRouter sets START name to "Pending" and only
@@ -212,6 +239,7 @@ def udp_receiver_loop(sock: socket.socket):
                     state.is_gesture_active = False
                     state.gesture_name_active = None
                     state.gesture_norm_points = []
+                    state.gaze_logging_frozen = False
                 elif evt == "FAIL":
                     failed_name = state.gesture_name_active or pkt.get("gesture_name")
                     print(
@@ -227,6 +255,7 @@ def udp_receiver_loop(sock: socket.socket):
                     state.is_gesture_active = False
                     state.gesture_name_active = None
                     state.gesture_norm_points = []
+                    state.gaze_logging_frozen = False
 
         elif ptype == "ASK_QUESTION":
             question = pkt.get("question", "").strip()
@@ -370,6 +399,20 @@ def process_ask_question(question: str):
         f"[ASK_QUESTION] phase2 sent name={final_response['name']!r} "
         f"answer_len={len(answer_text)} status={payload['status']}"
     )
+
+
+# =================== TRANSLATE OCR (stage 1, fired on Translate READY) ===================
+def _run_translate_ocr_stage(captured_frame, norm_points, gesture_name):
+    """Background worker for Translate stage 1. Calls the translate handler's
+    do_ocr() which runs OCR, caches the result, and sends a partial VLM_RESULT
+    so Unity can show the source text before the user confirms with a swipe."""
+    try:
+        from .handlers import translate as translate_handler  # lazy: handlers package imports network
+        rendered = translate_handler.do_ocr(captured_frame, norm_points, gesture_name)
+        with state.target_lock:
+            state.target_canvas = rendered
+    except Exception as exc:
+        print(f"[TRANSLATE-OCR][ERROR] {exc}")
 
 
 def _send_ask_error_to_unity(question: str, message: str):

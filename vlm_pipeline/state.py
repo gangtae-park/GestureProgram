@@ -16,6 +16,8 @@ latest_is_tracked = False
 is_gesture_active = False
 gesture_name_active = None
 gesture_norm_points = []        # list[(nx, ny)] inside current START..END window
+gaze_logging_frozen = False     # Compare: True after a READY marker -> stop appending gaze
+                                # (the "bring hands together" motion must not pollute the trail)
 pending_gesture_end = None      # dict {gesture_name, norm_points, ready_at}, consumed by main loop
 last_gesture_fail = None        # dict {gesture_name, reason, fail_time}, consumed by main loop
 
@@ -37,4 +39,12 @@ unity_sender_sock = None        # socket.socket | None  -- created in network.in
 # with the user's question + that crop.
 ask_lock = threading.Lock()
 latest_ask_target = None  # dict | None  -- {"crop", "target_meta", "gesture_name", "timestamp"}
+
+
+# ---- Translate gesture: cached OCR result waiting for the confirming swipe. ----
+# Populated by handlers/translate.do_ocr() on Translate READY; consumed by
+# handlers/translate.handle() on Translate END. Holds the OCR'd text + the
+# overlay/target_meta so the END stage only needs to run GPT translation.
+translate_lock = threading.Lock()
+latest_translate_pending = None  # dict | None -- {"text", "bbox", "gaze_bbox", "pick_mode", "pick_score", "timestamp"}
 
