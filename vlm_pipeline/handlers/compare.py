@@ -26,6 +26,7 @@ from .. import (
     config,
     geometry,
     network,
+    object_db,
     render,
     segmentation,
 )
@@ -95,6 +96,16 @@ def _match_worker(crops, target_meta, gesture_name):
             f"score={match_meta['score']:.3f} name={matched_obj.get('name')!r}"
         )
 
+    id_a = objects[0]["object_id"]
+    id_b = objects[1]["object_id"]
+    db = object_db.get_db()
+    compare_text = db.lookup_comparison(id_a, id_b) if db is not None else None
+    pair_id = "_vs_".join(sorted([id_a, id_b]))
+    pair_name = f"{objects[0]['name']} vs {objects[1]['name']}"
+    result_text = compare_text or "이 두 물체에 대한 비교 정보가 등록되어 있지 않습니다."
+    if compare_text is None:
+        print(f"[COMPARE] no comparison registered for pair=({id_a}, {id_b}); sending placeholder.")
+
     success_payload = {
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3],
         "gesture": gesture_name,
@@ -102,11 +113,16 @@ def _match_worker(crops, target_meta, gesture_name):
         "status": "ok",
         "target_meta": target_meta,
         "match_meta": match_metas,
-        "response": {"objects": objects},
+        "response": {
+            "name": pair_name,
+            "object_id": pair_id,
+            "result_search": result_text,
+            "objects": objects,
+        },
     }
     _persist(crops, target_meta, match_metas, success_payload)
     network.send_vlm_result_to_unity(success_payload)
-    print(f"[COMPARE] sent pair -> {[o['name'] for o in objects]}")
+    print(f"[COMPARE] sent pair -> {pair_name}")
 
 
 @register("Compare")

@@ -89,6 +89,21 @@ def build_feature_vector(gaze_dir_x, gaze_dir_y, gaze_dir_z):
     ], dtype=np.float64)
 
 
+def build_inverse_feature_vector(norm_x, norm_y):
+    """Quadratic polynomial expansion of the ADB-normalised 2D point.
+    Used to learn (norm_x, norm_y) -> (gaze_dir_x, gaze_dir_y); z is reconstructed
+    at inference as sqrt(1 - x^2 - y^2) under the assumption that the user faces
+    the screen (z > 0 over the calibration grid)."""
+    return np.array([
+        1.0,
+        norm_x,
+        norm_y,
+        norm_x * norm_x,
+        norm_y * norm_y,
+        norm_x * norm_y,
+    ], dtype=np.float64)
+
+
 def compute_mean_gaze_by_dot():
     mean_gaze_by_dot = {}
     for dot_index in sorted(TARGET_NORM_BY_DOT.keys()):
@@ -139,6 +154,23 @@ def fit_ridge_regression_model(alpha=RIDGE_ALPHA):
     predictions = X @ weights
     mse = float(np.mean((predictions - y) ** 2))
 
+    # ---- Inverse model: (norm_x, norm_y) -> (gaze_dir_x, gaze_dir_y) ----
+    X_inv = []
+    y_inv = []
+    for dot_index in available_indices:
+        target_norm_x, target_norm_y = TARGET_NORM_BY_DOT[dot_index]
+        mean_row = mean_gaze_by_dot[dot_index]
+        X_inv.append(build_inverse_feature_vector(target_norm_x, target_norm_y))
+        y_inv.append([mean_row["gaze_dir_x"], mean_row["gaze_dir_y"]])
+    X_inv = np.vstack(X_inv)
+    y_inv = np.asarray(y_inv, dtype=np.float64)
+
+    reg_inv = alpha * np.eye(X_inv.shape[1], dtype=np.float64)
+    reg_inv[0, 0] = 0.0
+    inverse_weights = np.linalg.solve(X_inv.T @ X_inv + reg_inv, X_inv.T @ y_inv)
+    inverse_predictions = X_inv @ inverse_weights
+    inverse_mse = float(np.mean((inverse_predictions - y_inv) ** 2))
+
     model_payload = {
         "ridge_alpha": alpha,
         "feature_order": [
@@ -155,6 +187,29 @@ def fit_ridge_regression_model(alpha=RIDGE_ALPHA):
         ],
         "weights": weights.tolist(),
         "training_mse": mse,
+        "inverse_feature_order": [
+            "bias",
+            "norm_x",
+            "norm_y",
+            "norm_x_sq",
+            "norm_y_sq",
+            "norm_x_mul_norm_y",
+        ],
+        "inverse_output_order": [
+            "gaze_dir_x",
+            "gaze_dir_y",
+        ],
+        "inverse_weights": inverse_weights.tolist(),
+        "inverse_training_mse": inverse_mse,
+        "inverse_predictions_by_dot": {
+            str(dot_index): {
+                "pred_gaze_dir_x": float(inverse_predictions[row_idx, 0]),
+                "pred_gaze_dir_y": float(inverse_predictions[row_idx, 1]),
+                "target_gaze_dir_x": mean_gaze_by_dot[dot_index]["gaze_dir_x"],
+                "target_gaze_dir_y": mean_gaze_by_dot[dot_index]["gaze_dir_y"],
+            }
+            for row_idx, dot_index in enumerate(available_indices)
+        },
         "mean_gaze_by_dot": mean_gaze_by_dot,
         "targets_by_dot": {
             str(dot_index): {
@@ -178,7 +233,7 @@ def fit_ridge_regression_model(alpha=RIDGE_ALPHA):
         json.dump(model_payload, f, indent=2)
 
     print(f"[MODEL] Saved ridge regression model to: {MODEL_OUTPUT_PATH.resolve()}")
-    print(f"[MODEL] training_mse={mse:.8f}")
+    print(f"[MODEL] forward training_mse={mse:.8f}")
     for row_idx, dot_index in enumerate(available_indices):
         pred_x = predictions[row_idx, 0]
         pred_y = predictions[row_idx, 1]
@@ -187,6 +242,17 @@ def fit_ridge_regression_model(alpha=RIDGE_ALPHA):
             f"[MODEL] dot={dot_index} "
             f"pred=({pred_x:.4f}, {pred_y:.4f}) "
             f"target=({target_x:.4f}, {target_y:.4f})"
+        )
+    print(f"[MODEL] inverse training_mse={inverse_mse:.8f}")
+    for row_idx, dot_index in enumerate(available_indices):
+        pred_gx = inverse_predictions[row_idx, 0]
+        pred_gy = inverse_predictions[row_idx, 1]
+        target_gx = mean_gaze_by_dot[dot_index]["gaze_dir_x"]
+        target_gy = mean_gaze_by_dot[dot_index]["gaze_dir_y"]
+        print(
+            f"[MODEL][INV] dot={dot_index} "
+            f"pred_gaze=({pred_gx:.4f}, {pred_gy:.4f}) "
+            f"target_gaze=({target_gx:.4f}, {target_gy:.4f})"
         )
 
     return model_payload

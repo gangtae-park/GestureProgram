@@ -26,6 +26,7 @@ from .. import (
     network,
     render,
     segmentation,
+    target_anchor,
 )
 from . import register
 
@@ -52,7 +53,7 @@ def _persist(crop_bgr, target_meta, match_meta, payload):
     print(f"[SEARCH] saved -> {base}.json")
 
 
-def _match_worker(crop_bgr, target_meta, gesture_name):
+def _match_worker(crop_bgr, target_meta, gesture_name, anchor=None):
     matched_obj, match_meta = clip_matcher.resolve_db_match(crop_bgr)
 
     if matched_obj is None:
@@ -76,9 +77,10 @@ def _match_worker(crop_bgr, target_meta, gesture_name):
         "name": matched_obj.get("name", ""),
         "result_search": matched_obj.get("result_search", ""),
     }
+    target_anchor.merge_into_response(response, anchor or {})
     print(
         f"[SEARCH] matched id={matched_obj['id']} score={match_meta['score']:.3f} "
-        f"name={matched_obj.get('name')!r}"
+        f"name={matched_obj.get('name')!r} depth={response.get('depth_meters', 0.0):.2f}m"
     )
     success_payload = {
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3],
@@ -167,9 +169,11 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
         ),
     }
 
+    anchor = target_anchor.compute(captured_frame, target.get("bbox"), target.get("mask_bool"))
+
     threading.Thread(
         target=_match_worker,
-        args=(crop_for_clip, target_meta, gesture_name),
+        args=(crop_for_clip, target_meta, gesture_name, anchor),
         daemon=True,
     ).start()
 

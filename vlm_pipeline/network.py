@@ -75,6 +75,22 @@ def parse_packet(msg: str) -> dict:
             "transcript": ",".join(parts[3:]).strip(),
         }
 
+    if pt == "OBJECT_ACTION":
+        # OBJECT_ACTION,<seq>,<time>,<action>,<object_id>,<second_object_id>,<request_id>
+        # Triggered when the user clicks a bubble-menu wedge; Python runs the
+        # action on the named DB object instead of re-detecting via YOLO/gaze.
+        if len(parts) < 7:
+            raise ValueError(f"OBJECT_ACTION expects 7 fields, got {len(parts)}")
+        return {
+            "type": "OBJECT_ACTION",
+            "seq": int(parts[1]),
+            "sender_time": float(parts[2]),
+            "action": parts[3].strip(),
+            "object_id": parts[4].strip(),
+            "second_object_id": parts[5].strip(),
+            "request_id": parts[6].strip(),
+        }
+
     raise ValueError(f"unknown packet type: {pt}")
 
 
@@ -279,6 +295,19 @@ def udp_receiver_loop(sock: socket.socket):
                 daemon=True,
             ).start()
 
+        elif ptype == "OBJECT_ACTION":
+            from . import object_action
+            print(
+                f"\n[OBJECT_ACTION] received seq={pkt['seq']} action={pkt['action']!r} "
+                f"object_id={pkt['object_id']!r} second={pkt['second_object_id']!r} "
+                f"request_id={pkt['request_id']!r}"
+            )
+            threading.Thread(
+                target=object_action.process,
+                args=(pkt,),
+                daemon=True,
+            ).start()
+
 
 # =================== ASK_QUESTION VLM PROCESSING ===================
 # When Unity sends ASK_QUESTION, we pair it with the most recently cached Ask target
@@ -323,6 +352,7 @@ def process_ask_question(question: str):
     match_meta = dict(cached.get("match_meta") or {})
     gesture_name = cached.get("gesture_name", "Ask")
     matched_object = cached.get("matched_object")
+    anchor = cached.get("anchor") or {}
 
     target_meta["user_question"] = question
 
@@ -371,6 +401,11 @@ def process_ask_question(question: str):
         "answer": answer_text,
         "user_question": question,
     }
+    # Re-attach the gesture-time anchor so Unity's AskResultCard spawn lands at
+    # the same world position as the AskQuestionCard did.
+    for key in ("gaze_dir_x", "gaze_dir_y", "gaze_dir_z", "depth_meters", "depth_source"):
+        if key in anchor:
+            final_response[key] = anchor[key]
     if not ok:
         final_response["error"] = error
 

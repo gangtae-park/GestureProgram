@@ -57,8 +57,9 @@ COMPARE_TOP_N = 2
 COMPARE_TARGET_COLORS = [(0, 255, 0), (0, 165, 255)]   # BGR: #1 green, #2 orange
 
 
-# =================== Calibration (gaze_dir -> norm_xy) ===================
+# =================== Calibration (gaze_dir -> norm_xy and back) ===================
 RIDGE_MODEL_PATH = "calibration_ridge_model.json"
+RIDGE_MODEL_ABS_PATH = os.path.join(_PARENT_DIR, RIDGE_MODEL_PATH)
 
 
 # =================== YOLO ===================

@@ -19,7 +19,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from .. import clip_matcher, config, geometry, network, render, segmentation
+from .. import clip_matcher, config, geometry, network, render, segmentation, target_anchor
 from . import register
 
 
@@ -115,6 +115,14 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
         reason = clip_matcher.fail_reason_for(match_meta["status"], match_meta)
         return _fail(overlay, gesture_name, reason, target_meta, match_meta=match_meta)
 
+    save_anchor = target_anchor.compute(captured_frame, target.get("bbox"), target.get("mask_bool"))
+    save_response = {
+        "name": matched_obj.get("name", ""),
+        "object_id": matched_obj.get("id", ""),
+        "message": "Save object recognised.",
+    }
+    target_anchor.merge_into_response(save_response, save_anchor)
+
     # ---- Success: ack Unity with just the matched object name + id ----
     # No further payload: Unity opens its own note-input UI and captures the
     # note text locally; the round trip ends here.
@@ -126,11 +134,7 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
         "stage": "ack",
         "target_meta": target_meta,
         "match_meta": match_meta,
-        "response": {
-            "name": matched_obj.get("name", ""),
-            "object_id": matched_obj.get("id", ""),
-            "message": "Save object recognised.",
-        },
+        "response": save_response,
     })
 
     cv2.putText(

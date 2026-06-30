@@ -31,6 +31,7 @@ from .. import (
     render,
     segmentation,
     state,
+    target_anchor,
 )
 from . import register
 
@@ -148,6 +149,19 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
             "timestamp": time.time(),
         }
 
+    anchor = target_anchor.compute(captured_frame, target.get("bbox"), target.get("mask_bool"))
+    ask_response = {
+        "name": matched_obj.get("name", ""),
+        "object_id": matched_obj.get("id", ""),
+    }
+    target_anchor.merge_into_response(ask_response, anchor)
+    # Stash the anchor so process_ask_question can reuse it for the phase-2
+    # AskResult payload (same object, same world position).
+    with state.ask_lock:
+        cached = state.latest_ask_target
+        if cached is not None:
+            cached["anchor"] = anchor
+
     recognized_payload = {
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3],
         "gesture": gesture_name,
@@ -156,10 +170,7 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
         "stage": "object_recognized",
         "target_meta": target_meta,
         "match_meta": match_meta,
-        "response": {
-            "name": matched_obj.get("name", ""),
-            "object_id": matched_obj.get("id", ""),
-        },
+        "response": ask_response,
     }
     network.send_vlm_result_to_unity(recognized_payload)
 

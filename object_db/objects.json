@@ -8,12 +8,18 @@
     {
       "id": "object_b",
       "name": "로지텍 M720",
-      "result_search": "•가격: 약 50,000원\n•센서 해상도: 1000±\n•배터리: AA 배터리 1개"
+      "result_search": "•가격: 약 50,000원\n•센서 해상도: 1000 DPI\n•배터리: AA 배터리 1개"
     },
     {
       "id": "object_c",
       "name": "허먼 밀러 SAYL 체어",
       "result_search": "•가격: 약 1,500,000원\n•특징: 3D 인텔리전트 서스펜션 후면 구조, POSTUREFIT 척추 지지 기능, 조화로운 틸팅 기능"
+    }
+  ],
+  "comparisons": [
+    {
+      "pair": ["object_a", "object_b"],
+      "result": "•가격: M650 약 48,000원 / M720 약 50,000원 — M650이 약 2,000원 저렴\n•센서 해상도: M650 400 DPI / M720 1000 DPI — M720이 2.5배 정밀\n•배터리: 둘 다 AA 배터리 1개 — 동일"
     }
   ]
 }

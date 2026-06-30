@@ -21,7 +21,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from .. import config, geometry, network, ocr, render, state
+from .. import config, geometry, network, ocr, render, state, target_anchor
 from ..vlm_client import translate_texts_to_korean
 from . import register
 
@@ -129,6 +129,9 @@ def do_ocr(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA,
     )
 
+    # Translate has no YOLO mask -- use bbox-only depth via target_anchor.
+    translate_anchor = target_anchor.compute(captured_frame, list(chosen["bbox"]), None)
+
     # Cache for stage 2.
     with state.translate_lock:
         state.latest_translate_pending = {
@@ -138,7 +141,14 @@ def do_ocr(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
             "pick_mode": pick_mode,
             "pick_score": float(pick_score),
             "timestamp": time.time(),
+            "anchor": translate_anchor,
         }
+
+    ocr_response = {
+        "name": chosen["text"],
+        "translation": "",
+    }
+    target_anchor.merge_into_response(ocr_response, translate_anchor)
 
     # Send partial result to Unity: source text, no translation yet.
     payload = {
@@ -154,10 +164,7 @@ def do_ocr(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
             "pick_score": float(pick_score),
             "gaze_bbox": list(gaze_bbox),
         },
-        "response": {
-            "name": chosen["text"],
-            "translation": "",
-        },
+        "response": ocr_response,
     }
     network.send_vlm_result_to_unity(payload)
 
@@ -209,6 +216,14 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
     print(f"  KO: {ko}")
     print("[Translate] ===========================")
 
+    translation_response = {
+        "name": text,
+        "translation": ko,
+    }
+    # Reuse the anchor cached at READY so the translation card lands at the
+    # same world position as the OCR preview did.
+    target_anchor.merge_into_response(translation_response, cached.get("anchor") or {})
+
     payload = {
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3],
         "gesture": gesture_name,
@@ -222,10 +237,7 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
             "pick_score": cached["pick_score"],
             "gaze_bbox": cached["gaze_bbox"],
         },
-        "response": {
-            "name": text,
-            "translation": ko,
-        },
+        "response": translation_response,
     }
     network.send_vlm_result_to_unity(payload)
 

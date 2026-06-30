@@ -13,7 +13,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from .. import clip_matcher, config, geometry, network, render, segmentation
+from .. import clip_matcher, config, geometry, network, render, segmentation, target_anchor
 from . import register
 
 
@@ -108,6 +108,14 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
         reason = clip_matcher.fail_reason_for(match_meta["status"], match_meta)
         return _fail(overlay, gesture_name, reason, target_meta, match_meta=match_meta)
 
+    anchor_block = target_anchor.compute(captured_frame, target.get("bbox"), target.get("mask_bool"))
+    anchor_response = {
+        "name": matched_obj.get("name", ""),
+        "object_id": matched_obj.get("id", ""),
+        "message": "Anchor object recognised.",
+    }
+    target_anchor.merge_into_response(anchor_response, anchor_block)
+
     # ---- Success: ack Unity with the matched object name ----
     network.send_vlm_result_to_unity({
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3],
@@ -117,11 +125,7 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
         "stage": "ack",
         "target_meta": target_meta,
         "match_meta": match_meta,
-        "response": {
-            "name": matched_obj.get("name", ""),
-            "object_id": matched_obj.get("id", ""),
-            "message": "Anchor object recognised.",
-        },
+        "response": anchor_response,
     })
 
     cv2.putText(

@@ -1,40 +1,39 @@
-"""HTTP server for Unity voice requests.
+"""HTTP server for Unity requests (ports the device pushes JSON to).
 
-It supports two paths:
-  1. /ask_voice      legacy raw WAV upload -> Whisper -> cached Ask target.
-  2. /voice_command  Android STT transcript + voice-start screenshot in one JSON
-                     request -> VLM -> Unity VLM_RESULT.
+Paths handled here:
+  1. /ask_voice      Android STT transcript JSON -> cached Ask target.
+                     Body { "transcript": "...", "request_id": "..." }.
+                     Dispatches process_ask_question(transcript) against the
+                     cached Ask target from handlers/ask.py. Result is pushed
+                     back to Unity over the UDP VLM_RESULT channel.
+  2. /voice_command  Android STT transcript + voice-start screenshot in one
+                     JSON request -> VLM -> Unity VLM_RESULT.
+  3. /object_ui      UI-interaction trigger. Delegates to vlm_pipeline.object_ui
+                     which runs YOLO + Depth Anything V2 + inverse calibration
+                     against the latest ADB-stream frame and ships per-detection
+                     {gaze_dir, depth_meters} back to Unity.
 
-Wire protocol (intentionally trivial):
-  Unity POSTs raw WAV bytes to  http://<python_host>:5007/ask_voice
-  Body Content-Type: audio/wav   (or anything; we only look at the bytes)
-  Server returns 200 OK after accepting -- the actual VLM result is pushed back
-  to Unity through the existing UDP VLM_RESULT channel (network.send_vlm_result_to_unity).
-
-The cached Ask target (set by handlers/ask.py at gesture END) is what the
-transcribed question gets paired with. If no cached target exists or it has
-expired, the server still echoes an error payload back to Unity so the card
-doesn't hang.
+Object-UI logic intentionally lives in a separate module so the depth/calibration
+deps don't bleed into the voice path.
 """
 import base64
 import http.server
 import json
 import socketserver
 import threading
-import time
 import uuid
 from datetime import datetime
 
 import cv2
 import numpy as np
 
-from . import config, segmentation, state, vlm_client
+from . import config, object_ui, state, vlm_client
 from .network import process_ask_question, send_vlm_result_to_unity
 
 
 VOICE_SERVER_PORT = 5007
-MAX_AUDIO_BYTES = 10 * 1024 * 1024   # 10 MB hard cap (~10 minutes at 16kHz mono PCM)
 MAX_VOICE_JSON_BYTES = 12 * 1024 * 1024
+MAX_ASK_TRANSCRIPT_JSON_BYTES = 64 * 1024  # transcripts are text; 64 KB is plenty
 
 
 class _AskVoiceHandler(http.server.BaseHTTPRequestHandler):
@@ -58,34 +57,45 @@ class _AskVoiceHandler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             length = 0
 
-        if length <= 0 or length > MAX_AUDIO_BYTES:
+        if length <= 0 or length > MAX_ASK_TRANSCRIPT_JSON_BYTES:
             self.send_response(400)
             self.end_headers()
             self.wfile.write(f"bad length {length}".encode("utf-8"))
             return
 
         try:
-            audio_bytes = self.rfile.read(length)
+            raw = self.rfile.read(length)
+            payload = json.loads(raw.decode("utf-8"))
         except Exception as e:
-            print(f"[VOICE-SERVER][ERROR] reading body: {e}")
-            self.send_response(500)
+            print(f"[ASK_VOICE][ERROR] bad JSON body: {e}")
+            self.send_response(400)
             self.end_headers()
+            self.wfile.write(b"bad json")
             return
 
-        print(f"[VOICE-SERVER] received {len(audio_bytes)} bytes from {self.client_address[0]}")
+        request_id = str(payload.get("request_id") or payload.get("requestId") or "")
+        transcript = str(payload.get("transcript") or "").strip()
+        print(
+            f"[ASK_VOICE] received request_id={request_id!r} "
+            f"transcript={transcript!r} from={self.client_address[0]}"
+        )
+
+        _remember_unity_host(self.client_address[0])
 
         # Hand off to a worker so we ack the POST immediately.
         threading.Thread(
-            target=_process_audio_async,
-            args=(audio_bytes,),
+            target=_process_ask_transcript_async,
+            args=(transcript, request_id),
             daemon=True,
         ).start()
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+        self.send_response(202)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.end_headers()
         try:
-            self.wfile.write(b"OK")
+            self.wfile.write(
+                json.dumps({"ok": True, "request_id": request_id}, ensure_ascii=False).encode("utf-8")
+            )
         except Exception:
             pass
 
@@ -159,13 +169,12 @@ class _AskVoiceHandler(http.server.BaseHTTPRequestHandler):
             return
 
         request_id = str(payload.get("request_id") or payload.get("requestId") or uuid.uuid4().hex)
-        image_b64_len = len(str(payload.get("image_base64") or ""))
-        print(f"[OBJECT_UI][RX] request_id={request_id} image_b64_len={image_b64_len} from={self.client_address[0]}")
+        print(f"[OBJECT_UI][RX] request_id={request_id} from={self.client_address[0]}")
 
         _remember_unity_host(self.client_address[0])
 
         threading.Thread(
-            target=_process_object_ui_async,
+            target=object_ui.process_request,
             args=(payload, request_id),
             daemon=True,
         ).start()
@@ -201,24 +210,26 @@ def _remember_unity_host(host: str):
         state.last_unity_addr = (host, 0)
 
 
-def _process_audio_async(audio_bytes: bytes):
-    text = vlm_client.transcribe_audio_bytes(audio_bytes, file_format="wav")
-    if not text or not text.strip():
-        print("[VOICE-SERVER] empty transcript; aborting.")
-        from .network import send_vlm_result_to_unity
+def _process_ask_transcript_async(transcript: str, request_id: str):
+    """Pair an on-device STT transcript with the cached Ask target."""
+    text = (transcript or "").strip()
+    if not text:
+        print(f"[ASK_VOICE] empty transcript request_id={request_id!r}; aborting.")
         send_vlm_result_to_unity({
             "timestamp": "",
             "gesture": "Ask",
-            "model": "whisper-1",
+            "model": "android_stt",
             "status": "fail",
             "stage": "answer",
+            "request_id": request_id,
+            "requestId": request_id,
             "target_meta": {"user_question": ""},
-            "response": {"error": "Couldn't understand audio. Please try again."},
+            "response": {"error": "빈 음성 입력이 수신되었습니다. 다시 시도해주세요."},
         })
         return
 
-    print(f"[VOICE-SERVER] dispatching to Ask pipeline: {text!r}")
-    process_ask_question(text.strip())
+    print(f"[ASK_VOICE] dispatching to Ask pipeline request_id={request_id!r} text={text!r}")
+    process_ask_question(text)
 
 
 def _decode_image_base64(image_base64: str):
@@ -346,105 +357,6 @@ def _process_voice_command_async(payload: dict):
     )
 
 
-def _process_object_ui_async(payload: dict, request_id: str):
-    # Galaxy XR's Unity ScreenCapture can only see Unity-rendered content;
-    # passthrough is composited by the OS and never reaches Unity's frame
-    # buffer. So the image Unity used to POST was effectively blank and YOLO
-    # detected nothing. Instead we run YOLO against the latest ADB-streamed
-    # frame (state.latest_frame) -- that's the same source the gesture
-    # handlers (Search/Anchor/Save/etc.) already use successfully, because
-    # the ADB screenrecord stream captures the OS-composited display.
-    with state.frame_lock:
-        image_bgr = None if state.latest_frame is None else state.latest_frame.copy()
-
-    if image_bgr is None:
-        reason = "no ADB stream frame yet (is adb screenrecord running?)"
-        print(f"[OBJECT_UI][ERROR] {reason} request_id={request_id}")
-        _send_object_ui_result(request_id, [], payload, status="fail", reason=reason)
-        return
-
-    h, w = image_bgr.shape[:2]
-    print(f"[OBJECT_UI][RX] request_id={request_id} source=ADB_stream frame={w}x{h}")
-
-    # DEBUG: dump the frame YOLO sees so we can verify content + tune later.
-    try:
-        import os, cv2 as _cv2
-        os.makedirs("/tmp/object_ui_debug", exist_ok=True)
-        _path = f"/tmp/object_ui_debug/{request_id}.jpg"
-        _cv2.imwrite(_path, image_bgr)
-        print(f"[OBJECT_UI][DEBUG] saved frame -> {_path}")
-    except Exception as _e:
-        print(f"[OBJECT_UI][DEBUG] save failed: {_e}")
-
-    t0 = time.perf_counter()
-    detections_raw = segmentation.run_yolo(image_bgr)
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
-    print(f"[OBJECT_UI][YOLO] detections={len(detections_raw)} request_id={request_id} elapsed_ms={elapsed_ms:.0f}")
-
-    # Override the dimension fields in the source payload so the response
-    # advertises the ADB-stream resolution (which is what bboxes are in),
-    # not whatever Unity put there.
-    payload_for_response = dict(payload)
-    payload_for_response["image_width"] = w
-    payload_for_response["image_height"] = h
-
-    detections = []
-    for i, item in enumerate(detections_raw):
-        bbox = [float(v) for v in item.get("bbox", (0, 0, 0, 0))]
-        class_name = str(item.get("class_name") or item.get("class_id") or "detected_object")
-        confidence = float(item.get("conf") or 0.0)
-        det = {
-            "request_id": request_id,
-            "requestId": request_id,
-            "label": class_name,
-            "class_name": class_name,
-            "confidence": confidence,
-            "conf": confidence,
-            "bbox": bbox,
-            "image_width": w,
-            "image_height": h,
-            "imageWidth": w,
-            "imageHeight": h,
-        }
-        detections.append(det)
-        print(f"[OBJECT_UI][YOLO] det[{i}] class={class_name} conf={confidence:.3f} bbox={bbox}")
-
-    _send_object_ui_result(request_id, detections, payload_for_response)
-
-
-def _send_object_ui_result(request_id: str, detections: list, source_payload: dict, status: str = "ok", reason: str = ""):
-    payload = {
-        "request_id": request_id,
-        "requestId": request_id,
-        "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3],
-        "gesture": "ObjectUI",
-        "model": f"YOLO({config.SEG_MODEL_PATH})",
-        "status": status,
-        "stage": "yolo",
-        "reason": reason,
-        "detections": detections,
-        "image_width": int(source_payload.get("image_width") or 0),
-        "image_height": int(source_payload.get("image_height") or 0),
-        "imageWidth": int(source_payload.get("image_width") or 0),
-        "imageHeight": int(source_payload.get("image_height") or 0),
-        "target_meta": {
-            "source": "unity_object_ui_capture",
-            "mode": source_payload.get("mode", "object_ui"),
-            "gaze_tracked": bool(source_payload.get("gaze_tracked", False)),
-            "gaze_viewport": [
-                float(source_payload.get("gaze_viewport_x") or 0.5),
-                float(source_payload.get("gaze_viewport_y") or 0.5),
-            ],
-        },
-        "response": {
-            "name": "ObjectUI",
-            "raw": f"detections={len(detections)}",
-            "error": reason if status != "ok" else "",
-        },
-    }
-    send_vlm_result_to_unity(payload)
-
-
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -467,5 +379,5 @@ def start_voice_server_thread() -> bool:
 
     t = threading.Thread(target=_server_instance.serve_forever, daemon=True)
     t.start()
-    print(f"[VOICE-SERVER] listening on 0.0.0.0:{VOICE_SERVER_PORT}/ask_voice")
+    print(f"[VOICE-SERVER] listening on 0.0.0.0:{VOICE_SERVER_PORT} (paths: /ask_voice, /voice_command, /object_ui)")
     return True

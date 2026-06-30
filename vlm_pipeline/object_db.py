@@ -35,16 +35,27 @@ def get_db():
 
 class ObjectDB:
     def __init__(self, objects: list, embeddings: np.ndarray,
-                 embedding_object_ids: list, source_paths: list):
+                 embedding_object_ids: list, source_paths: list,
+                 comparisons: dict = None):
         self.objects = objects
         self._by_id = {o["id"]: o for o in objects}
         # (N, D) float32, rows already L2-normalised so cosine = dot product.
         self.embedding_matrix = embeddings
         self.embedding_object_ids = embedding_object_ids  # length N
         self.source_paths = source_paths                  # length N
+        # Compare lookup: key is tuple(sorted([id_a, id_b])), value is comparison text.
+        self._comparisons = comparisons or {}
 
     def get_object(self, obj_id: str) -> dict:
         return self._by_id.get(obj_id)
+
+    def lookup_comparison(self, id_a: str, id_b: str):
+        """Return the comparison text for a pair of object ids, order-independent.
+        None if the pair is not registered (or the same id was passed twice)."""
+        if not id_a or not id_b or id_a == id_b:
+            return None
+        key = tuple(sorted([id_a, id_b]))
+        return self._comparisons.get(key)
 
     def summary(self) -> str:
         per_obj_counts = {oid: 0 for oid in self._by_id.keys()}
@@ -72,9 +83,10 @@ def load_object_db() -> bool:
         return False
 
     objects = doc.get("objects") or []
+    comparisons = _parse_comparisons(doc.get("comparisons") or [], objects)
     if not objects:
         print("[OBJDB][WARN] objects.json has no entries.")
-        _db = ObjectDB([], np.zeros((0, 1), dtype=np.float32), [], [])
+        _db = ObjectDB([], np.zeros((0, 1), dtype=np.float32), [], [], comparisons)
         return True
 
     # Gather reference image paths per object.
@@ -99,13 +111,38 @@ def load_object_db() -> bool:
         objects, image_paths_by_obj
     )
 
-    _db = ObjectDB(objects, embeddings, embedding_object_ids, source_paths)
+    _db = ObjectDB(objects, embeddings, embedding_object_ids, source_paths, comparisons)
     total_refs = len(embedding_object_ids)
     print(
-        f"[OBJDB] {len(objects)} objects, {total_refs} reference images. "
-        f"Counts: {_db.summary()}"
+        f"[OBJDB] {len(objects)} objects, {total_refs} reference images, "
+        f"{len(comparisons)} comparison pairs. Counts: {_db.summary()}"
     )
     return True
+
+
+def _parse_comparisons(entries: list, objects: list) -> dict:
+    """Build {sorted_pair_tuple: result_text} from objects.json 'comparisons'.
+    Skips entries whose pair references an unknown id or that are malformed."""
+    known_ids = {o["id"] for o in objects if "id" in o}
+    indexed = {}
+    for entry in entries:
+        pair = entry.get("pair") if isinstance(entry, dict) else None
+        result = entry.get("result") if isinstance(entry, dict) else None
+        if not pair or len(pair) != 2 or not result:
+            print(f"[OBJDB][WARN] skipping malformed comparison entry: {entry!r}")
+            continue
+        id_a, id_b = pair[0], pair[1]
+        if id_a == id_b:
+            print(f"[OBJDB][WARN] skipping self-pair comparison: {pair!r}")
+            continue
+        if known_ids and (id_a not in known_ids or id_b not in known_ids):
+            print(f"[OBJDB][WARN] comparison references unknown id(s): {pair!r}")
+            continue
+        key = tuple(sorted([id_a, id_b]))
+        if key in indexed:
+            print(f"[OBJDB][WARN] duplicate comparison for {key!r}; overwriting.")
+        indexed[key] = result
+    return indexed
 
 
 # ---------------- embedding cache ----------------
