@@ -140,19 +140,31 @@ def _do_ask(obj: dict, request_id: str):
 def _do_compare(obj_a: dict, obj_b: dict, request_id: str):
     a_id, b_id = obj_a.get("id", ""), obj_b.get("id", "")
     db = object_db.get_db()
-    compare_text = db.lookup_comparison(a_id, b_id) if db is not None else None
+    compare_rows = db.lookup_comparison(a_id, b_id) if db is not None else None
 
-    pair_name = f"{obj_a.get('name', a_id)} vs {obj_b.get('name', b_id)}"
+    name_a = obj_a.get("name", a_id)
+    name_b = obj_b.get("name", b_id)
+    pair_name = f"{name_a} vs {name_b}"
     pair_id = "_vs_".join(sorted([a_id, b_id]))
-    result_text = compare_text or "이 두 물체에 대한 비교 정보가 등록되어 있지 않습니다."
+
+    if not compare_rows:
+        print(f"[OBJECT_ACTION][Compare] no comparison registered for ({a_id}, {b_id}); placeholder.")
+        compare_rows = [{
+            "category": "",
+            "value_a": "비교 정보가 등록되어 있지 않습니다.",
+            "value_b": "",
+        }]
 
     response = {
         "name": pair_name,
         "object_id": pair_id,
-        "result_search": result_text,
+        "name_a": name_a,
+        "name_b": name_b,
+        "compare_rows": compare_rows,
+        "result_search": _compare_rows_to_text(name_a, name_b, compare_rows),
         "objects": [
-            {"name": obj_a.get("name", ""), "object_id": a_id, "result_search": obj_a.get("result_search", "")},
-            {"name": obj_b.get("name", ""), "object_id": b_id, "result_search": obj_b.get("result_search", "")},
+            {"name": name_a, "object_id": a_id, "result_search": obj_a.get("result_search", "")},
+            {"name": name_b, "object_id": b_id, "result_search": obj_b.get("result_search", "")},
         ],
     }
     payload = _base_payload(
@@ -162,17 +174,35 @@ def _do_compare(obj_a: dict, obj_b: dict, request_id: str):
         response=response,
     )
     network.send_vlm_result_to_unity(payload)
-    print(f"[OBJECT_ACTION][Compare] sent {pair_name}")
+    print(f"[OBJECT_ACTION][Compare] sent {pair_name} ({len(compare_rows)} rows)")
+
+
+def _compare_rows_to_text(name_a: str, name_b: str, rows: list) -> str:
+    if not rows:
+        return ""
+    lines = []
+    for row in rows:
+        cat = (row.get("category") or "").strip()
+        va = (row.get("value_a") or "").strip()
+        vb = (row.get("value_b") or "").strip()
+        prefix = f"•{cat}: " if cat else "•"
+        lines.append(f"{prefix}{name_a} {va} / {name_b} {vb}")
+    return "\n".join(lines)
 
 
 def _do_anchor(obj: dict, request_id: str):
-    anchor = _fresh_anchor_for_object(obj)
+    # Fast-path: Anchor only needs DB metadata. Unity already knows the world
+    # position from the clicked bubble (OverrideNextSpawnPosition was set by
+    # ObjectActionCommandBridge before this packet was sent), so we don't
+    # re-run YOLO + CLIP + Depth Anything just to recompute gaze_dir/depth
+    # that the spawner will ignore. depth_meters is left at 0 so the spawner
+    # consumes the override unchanged. Round-trip is now milliseconds, not
+    # seconds.
     response = {
         "name": obj.get("name", ""),
         "object_id": obj.get("id", ""),
         "message": "Anchor object recognised.",
     }
-    target_anchor.merge_into_response(response, _clean_anchor(anchor) or {})
     payload = _base_payload(
         gesture="Anchor",
         request_id=request_id,
@@ -181,17 +211,17 @@ def _do_anchor(obj: dict, request_id: str):
         stage="ack",
     )
     network.send_vlm_result_to_unity(payload)
-    print(f"[OBJECT_ACTION][Anchor] sent name={response['name']!r}")
+    print(f"[OBJECT_ACTION][Anchor] fast-path sent name={response['name']!r}")
 
 
 def _do_save(obj: dict, request_id: str):
-    anchor = _fresh_anchor_for_object(obj)
+    # Same fast-path reasoning as Anchor: NoteManager just needs the DB record
+    # and a world position. Unity's override supplies the position.
     response = {
         "name": obj.get("name", ""),
         "object_id": obj.get("id", ""),
         "message": "Save object recognised.",
     }
-    target_anchor.merge_into_response(response, _clean_anchor(anchor) or {})
     payload = _base_payload(
         gesture="Save",
         request_id=request_id,
@@ -200,7 +230,7 @@ def _do_save(obj: dict, request_id: str):
         stage="ack",
     )
     network.send_vlm_result_to_unity(payload)
-    print(f"[OBJECT_ACTION][Save] sent name={response['name']!r}")
+    print(f"[OBJECT_ACTION][Save] fast-path sent name={response['name']!r}")
 
 
 def _do_capture(obj: dict, request_id: str):

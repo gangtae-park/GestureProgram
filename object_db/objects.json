@@ -19,7 +19,11 @@
   "comparisons": [
     {
       "pair": ["object_a", "object_b"],
-      "result": "•가격: M650 약 48,000원 / M720 약 50,000원 — M650이 약 2,000원 저렴\n•센서 해상도: M650 400 DPI / M720 1000 DPI — M720이 2.5배 정밀\n•배터리: 둘 다 AA 배터리 1개 — 동일"
+      "result": [
+        { "category": "가격",       "object_a": "약 48,000원", "object_b": "약 50,000원" },
+        { "category": "센서 해상도", "object_a": "400 DPI",    "object_b": "1000 DPI" },
+        { "category": "배터리",     "object_a": "AA 1개",      "object_b": "AA 1개" }
+      ]
     }
   ]
 }

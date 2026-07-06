@@ -99,12 +99,29 @@ def _match_worker(crops, target_meta, gesture_name):
     id_a = objects[0]["object_id"]
     id_b = objects[1]["object_id"]
     db = object_db.get_db()
-    compare_text = db.lookup_comparison(id_a, id_b) if db is not None else None
+    compare_rows = db.lookup_comparison(id_a, id_b) if db is not None else None
     pair_id = "_vs_".join(sorted([id_a, id_b]))
-    pair_name = f"{objects[0]['name']} vs {objects[1]['name']}"
-    result_text = compare_text or "이 두 물체에 대한 비교 정보가 등록되어 있지 않습니다."
-    if compare_text is None:
+    name_a, name_b = objects[0]["name"], objects[1]["name"]
+    pair_name = f"{name_a} vs {name_b}"
+
+    if not compare_rows:
         print(f"[COMPARE] no comparison registered for pair=({id_a}, {id_b}); sending placeholder.")
+        compare_rows = [{
+            "category": "",
+            "value_a": "비교 정보가 등록되어 있지 않습니다.",
+            "value_b": "",
+        }]
+
+    response = {
+        "name": pair_name,
+        "object_id": pair_id,
+        "name_a": name_a,
+        "name_b": name_b,
+        "compare_rows": compare_rows,
+        # Plain-text fallback for legacy renderers (e.g. SearchResultCard).
+        "result_search": _compare_rows_to_text(name_a, name_b, compare_rows),
+        "objects": objects,
+    }
 
     success_payload = {
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3],
@@ -113,16 +130,26 @@ def _match_worker(crops, target_meta, gesture_name):
         "status": "ok",
         "target_meta": target_meta,
         "match_meta": match_metas,
-        "response": {
-            "name": pair_name,
-            "object_id": pair_id,
-            "result_search": result_text,
-            "objects": objects,
-        },
+        "response": response,
     }
     _persist(crops, target_meta, match_metas, success_payload)
     network.send_vlm_result_to_unity(success_payload)
-    print(f"[COMPARE] sent pair -> {pair_name}")
+    print(f"[COMPARE] sent pair -> {pair_name} ({len(compare_rows)} rows)")
+
+
+def _compare_rows_to_text(name_a: str, name_b: str, rows: list) -> str:
+    """Multi-line rendering of compare_rows for cards that only know the
+    legacy `result_search` text field."""
+    if not rows:
+        return ""
+    lines = []
+    for row in rows:
+        cat = (row.get("category") or "").strip()
+        va = (row.get("value_a") or "").strip()
+        vb = (row.get("value_b") or "").strip()
+        prefix = f"•{cat}: " if cat else "•"
+        lines.append(f"{prefix}{name_a} {va} / {name_b} {vb}")
+    return "\n".join(lines)
 
 
 @register("Compare")

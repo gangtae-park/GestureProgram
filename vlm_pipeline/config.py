@@ -70,19 +70,26 @@ MAX_SEGMENTS_TO_RENDER = 80         # Cap drawn boxes only; scoring still uses a
 
 
 # =================== CLIP + object DB ===================
-CLIP_MODEL_NAME = "ViT-B-32"
-CLIP_PRETRAINED = "openai"
+# EVA-02-L/14 at 336px. Drop-in replacement for the older ViT-B/32; clearer
+# score separation on the closed 3-object set. First load auto-downloads
+# ~430 MB from HuggingFace.
+CLIP_MODEL_NAME = "EVA02-L-14-336"
+CLIP_PRETRAINED = "merged2b_s6b_b61k"
 
 # Object DB lives in MacProgram/object_db/.
 #   objects.json         metadata + per-object info text
 #   images/<obj_id>/*    reference images for each object
 #   embeddings.npz       cached CLIP embeddings, regenerated when images change
+#                        OR when CLIP_MODEL_NAME/CLIP_PRETRAINED change.
 OBJECT_DB_DIR = os.path.join(_PARENT_DIR, "object_db")
 OBJECT_DB_JSON = os.path.join(OBJECT_DB_DIR, "objects.json")
 OBJECT_DB_IMAGES_DIR = os.path.join(OBJECT_DB_DIR, "images")
 OBJECT_DB_EMBEDDINGS_PATH = os.path.join(OBJECT_DB_DIR, "embeddings.npz")
 
-CLIP_MATCH_MIN_SCORE = 0.7
+# EVA-02 produces a tighter score distribution than ViT-B/32 -- matched pairs
+# tend to land in 0.55-0.75 (with the embedding-space cosine being a bit lower
+# than ViT-B/32 numerically). Keep masked_crop off per the reference paper.
+CLIP_MATCH_MIN_SCORE = 0.55
 CLIP_USE_MASKED_CROP = False
 
 

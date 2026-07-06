@@ -50,12 +50,32 @@ class ObjectDB:
         return self._by_id.get(obj_id)
 
     def lookup_comparison(self, id_a: str, id_b: str):
-        """Return the comparison text for a pair of object ids, order-independent.
-        None if the pair is not registered (or the same id was passed twice)."""
+        """Look up a comparison and return it oriented to the caller's id order.
+
+        Returns a list of rows shaped `[{"category": str, "value_a": str,
+        "value_b": str}, ...]` where `value_a` always corresponds to the first
+        argument (`id_a`) and `value_b` to the second, regardless of how the
+        entry was stored in objects.json. Returns None if no entry exists or
+        the same id is passed twice.
+        """
         if not id_a or not id_b or id_a == id_b:
             return None
         key = tuple(sorted([id_a, id_b]))
-        return self._comparisons.get(key)
+        record = self._comparisons.get(key)
+        if record is None:
+            return None
+
+        # record["rows"] is a list of dicts whose keys are the literal object
+        # ids ("object_a", "object_b", etc., matching the `pair` storage order).
+        stored_a, stored_b = record["pair"]
+        out = []
+        for row in record["rows"]:
+            out.append({
+                "category": str(row.get("category", "")),
+                "value_a": str(row.get(id_a, row.get(stored_a, ""))),
+                "value_b": str(row.get(id_b, row.get(stored_b, ""))),
+            })
+        return out
 
     def summary(self) -> str:
         per_obj_counts = {oid: 0 for oid in self._by_id.keys()}
@@ -121,8 +141,16 @@ def load_object_db() -> bool:
 
 
 def _parse_comparisons(entries: list, objects: list) -> dict:
-    """Build {sorted_pair_tuple: result_text} from objects.json 'comparisons'.
-    Skips entries whose pair references an unknown id or that are malformed."""
+    """Build {sorted_pair_tuple: {"pair": [id_a, id_b], "rows": [...]}}.
+
+    Each `result` is expected to be a list of category rows, each row keyed by
+    category name plus the literal object ids of the pair:
+        { "category": "가격", "object_a": "...", "object_b": "..." }
+
+    We retain the storage-order `pair` so lookup_comparison() can re-orient
+    rows for callers that query in the opposite order. Skips entries whose
+    pair references an unknown id or that are malformed.
+    """
     known_ids = {o["id"] for o in objects if "id" in o}
     indexed = {}
     for entry in entries:
@@ -138,19 +166,39 @@ def _parse_comparisons(entries: list, objects: list) -> dict:
         if known_ids and (id_a not in known_ids or id_b not in known_ids):
             print(f"[OBJDB][WARN] comparison references unknown id(s): {pair!r}")
             continue
+
+        # Normalise into a uniform row-list shape.
+        if isinstance(result, str):
+            # Backwards-compat: legacy flat-text entries become a single row.
+            rows = [{"category": "", id_a: result, id_b: result}]
+        elif isinstance(result, list):
+            rows = [row for row in result if isinstance(row, dict)]
+        else:
+            print(f"[OBJDB][WARN] comparison.result is neither list nor str: {entry!r}")
+            continue
+
+        if not rows:
+            print(f"[OBJDB][WARN] comparison has no usable rows: {entry!r}")
+            continue
+
         key = tuple(sorted([id_a, id_b]))
         if key in indexed:
             print(f"[OBJDB][WARN] duplicate comparison for {key!r}; overwriting.")
-        indexed[key] = result
+        indexed[key] = {"pair": [id_a, id_b], "rows": rows}
     return indexed
 
 
 # ---------------- embedding cache ----------------
 def _cache_signature(image_paths_by_obj: dict) -> dict:
-    """A snapshot of every reference image's mtime -- if anything changes the
-    cache is invalidated and we re-embed.
+    """A snapshot of every reference image's mtime plus the active CLIP model
+    identity. Any change (new image, swapped backbone) flips the signature so
+    _try_load_cache rebuilds. This is what makes "switch CLIP_MODEL_NAME and
+    re-run" work without manually deleting embeddings.npz -- different model
+    -> different embedding dimensions / semantics, so the old cache is unsafe.
     """
-    sig = {}
+    sig = {
+        "__clip_model__": f"{config.CLIP_MODEL_NAME}/{config.CLIP_PRETRAINED}",
+    }
     for oid, paths in image_paths_by_obj.items():
         for p in paths:
             try:
