@@ -33,6 +33,11 @@ _initialised = False
 _ready = False
 _model_id = "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
 
+# Debug logging: prints per-inference stats (min/median/max/mean depth in
+# metres) so you can sanity-check the model against reality. Toggle to False
+# if the console gets noisy.
+verbose_logging = True
+
 
 def configure(model_id: Optional[str] = None) -> None:
     """Change the checkpoint id (must be called before the first estimate())."""
@@ -137,6 +142,24 @@ def estimate(frame_bgr: np.ndarray) -> Optional[np.ndarray]:
             align_corners=False,
         ).squeeze(1).squeeze(0)
         depth_np = depth.detach().to(_torch.float32).cpu().numpy()
+
+        if verbose_logging:
+            # min / median / max / mean give a quick reality check: for a
+            # typical desk-distance scene (Depth-Anything-V2 metric-indoor)
+            # values usually sit in ~0.3-3 m. Way outside that range means the
+            # model isn't producing metric distances on this scene.
+            try:
+                d_min = float(np.min(depth_np))
+                d_med = float(np.median(depth_np))
+                d_max = float(np.max(depth_np))
+                d_mean = float(np.mean(depth_np))
+                print(
+                    f"[DEPTH_MAP] shape={depth_np.shape} "
+                    f"min={d_min:.2f}m median={d_med:.2f}m "
+                    f"max={d_max:.2f}m mean={d_mean:.2f}m"
+                )
+            except Exception:
+                pass
         return depth_np
     except Exception as exc:
         print(f"[DEPTH][ERROR] inference failed: {exc}")

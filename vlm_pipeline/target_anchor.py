@@ -72,6 +72,18 @@ def compute(frame_bgr: Optional[np.ndarray],
                 out["depth_source"] = "bbox"
 
     out["anchor_ok"] = out["depth_meters"] > 0.0
+
+    # Per-target diagnostic: makes it easy to see what depth each gesture is
+    # about to ship to Unity, and whether the mask/bbox median actually
+    # produced a value. depth_meters=0.0 + source=none means the depth model
+    # returned nothing usable and Unity will fall back to gaze-only spawn.
+    print(
+        f"[DEPTH_TARGET] bbox=[{x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}] "
+        f"norm=({norm_x:.3f},{norm_y:.3f}) "
+        f"depth={out['depth_meters']:.2f}m source={out['depth_source']} "
+        f"gaze=({out['gaze_dir_x']:+.3f},{out['gaze_dir_y']:+.3f},{out['gaze_dir_z']:+.3f}) "
+        f"ok={out['anchor_ok']}"
+    )
     return out
 
 

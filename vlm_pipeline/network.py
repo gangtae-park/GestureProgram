@@ -218,25 +218,14 @@ def udp_receiver_loop(sock: socket.socket):
                 elif evt == "READY":
                     # Compare arming marker: freeze the gaze trail here so the
                     # "bring hands together" motion that follows is not logged.
-                    # Translate's READY does the same gaze freeze AND triggers
-                    # stage-1 OCR via the translate handler. END (after the
-                    # confirming swipe) then runs the GPT translation.
+                    # Translate no longer sends READY (the swipe confirmation
+                    # step was removed) -- END alone triggers OCR + translation
+                    # inside handlers/translate.handle().
                     state.gaze_logging_frozen = True
                     print(
                         f"\n[GESTURE] READY name={pkt_name} "
                         f"seq={pkt['seq']} pts_frozen={len(state.gesture_norm_points)}"
                     )
-                    if pkt_name == "Translate":
-                        # Snapshot the frame + gaze trail right now, then dispatch
-                        # OCR on a background thread so the UDP loop keeps draining.
-                        with state.frame_lock:
-                            captured = None if state.latest_frame is None else state.latest_frame.copy()
-                        snapshot_points = list(state.gesture_norm_points)
-                        threading.Thread(
-                            target=_run_translate_ocr_stage,
-                            args=(captured, snapshot_points, pkt_name),
-                            daemon=True,
-                        ).start()
                 elif evt == "END":
                     # Prefer END's gesture_name over the START-time placeholder
                     # (Unity GestureRouter sets START name to "Pending" and only

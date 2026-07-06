@@ -178,8 +178,14 @@ def do_ocr(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
 
 @register("Translate")
 def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.ndarray:
-    """Stage 2 -- called on Translate END (after the palm-forward swipe).
-    Pulls the cached OCR text and runs GPT translation."""
+    """Called on Translate END. Since the palm-swipe confirmation step was
+    removed for usability, Translate now fires END the moment Jackknife
+    matches -- there's no separate READY event anymore.
+
+    If no OCR result is cached (the normal case now), we run the OCR pass
+    inline right here, then run the GPT translation. Unity's SpawnTranslateResult
+    handles both stages: it shows the OCR text with a "translating..." placeholder
+    on the first packet and swaps in the Korean translation on the second."""
     overlay = (
         render.placeholder_canvas("Translate END")
         if captured_frame is None else captured_frame.copy()
@@ -190,11 +196,20 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
         state.latest_translate_pending = None
 
     if cached is None:
-        reason = "no cached OCR (did READY fire?)"
-        print(f"[Translate] END but {reason}")
-        network.send_gesture_fail_to_unity(gesture_name, reason, {"stage": "translation"})
+        # Run OCR inline; do_ocr populates state.latest_translate_pending and
+        # emits an intermediate stage='ocr' VLM_RESULT so Unity's card can show
+        # the source text immediately.
+        print("[Translate] END with no cached OCR (post-swipe-removal path); running OCR inline.")
+        do_ocr(captured_frame, norm_points, gesture_name)
+        with state.translate_lock:
+            cached = state.latest_translate_pending
+            state.latest_translate_pending = None
+
+    if cached is None:
+        # OCR failed to find usable text; do_ocr already sent a fail packet.
+        print("[Translate] inline OCR produced no usable text; giving up.")
         cv2.putText(
-            overlay, f"TRANSLATE FAIL: {reason}",
+            overlay, "TRANSLATE FAIL: no OCR text",
             (20, overlay.shape[0] - 30),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA,
         )
