@@ -90,7 +90,7 @@ OBJECT_DB_EMBEDDINGS_PATH = os.path.join(OBJECT_DB_DIR, "embeddings.npz")
 # tend to land in 0.55-0.75 (with the embedding-space cosine being a bit lower
 # than ViT-B/32 numerically). Keep masked_crop off per the reference paper.
 CLIP_MATCH_MIN_SCORE = 0.55
-CLIP_USE_MASKED_CROP = False
+CLIP_USE_MASKED_CROP = True
 
 
 # =================== VLM (OpenAI GPT) ===================
@@ -132,20 +132,92 @@ Style:
   instead of guessing.
 """
 
-# Structured after Figure 8 of GazePointAR (Lee et al., CHI '24). The paper's
-# prompt has five bands: original query, gaze target, pointing target, other
-# scene objects, and an answering rubric. We keep the same shape but adapt
-# three things for our stack:
-#   1. GazePointAR fed GPT-3 pre-extracted text (YOLO parent + OCR children).
-#      We use GPT-5 vision, so instead of a phrase we ship the raw ADB
-#      passthrough frame plus an EXPLICIT gaze pixel coordinate ({gaze_info})
-#      that Unity computed from the user's eye tracker. The model uses that
-#      coordinate to look at the right spot in the image itself.
-#   2. Our pointing signal is implicit -- if the user's hand is in the frame
-#      pointing at something, GPT-5 can see it directly. We call this out as
-#      a fallback that outranks gaze only when clearly present.
-#   3. Answer language follows the user's transcript language (Korean/English)
-#      instead of always English.
+# -------- Voice intent classifier --------
+# The voice mode used to always call GPT with a free-form Q&A prompt. That
+# meant a Voice user could never trigger the same DB-backed cards that
+# gesture / UI users see (Search, Anchor, Save, Compare, Translate, Capture).
+# This classifier picks the closest of the 7 canonical referents; anything
+# unclear falls through to Ask, which is the open-ended fallback per the
+# study design.
+#
+# The intent names MUST match the strings that Unity's ResultCardSpawner
+# switches on (see ResultCardSpawner.HandleResult in Assets/Scripts/):
+#   "Search/Find Info", "Ask", "Translate", "Compare", "Anchor",
+#   "Save", "Capture".
+VOICE_INTENT_PROMPT = """\
+You classify a voice command spoken by a user wearing an XR headset. The
+user is looking at a real-world object and may want to do one of the
+following seven actions with it. Return EXACTLY the canonical intent name.
+
+===== Canonical intents =====
+1. "Search/Find Info" -- The user wants factual info / description of the
+   object they are looking at. Typical phrasings: "what is this?", "tell me
+   about this", "이거 뭐야?", "이게 뭔지 알려줘", "설명해줘".
+2. "Translate" -- The user wants text visible on/near the target translated.
+   Phrasings: "translate this", "이거 번역해줘", "read this in English".
+3. "Compare" -- The user wants two visible objects compared. Phrasings:
+   "compare these", "which one is better?", "이거랑 저거 비교해줘",
+   "둘 중 뭐가 나아?".
+4. "Anchor" -- The user wants a spatial anchor / pin dropped on the target
+   so they can find it again later. Phrasings: "anchor this", "pin this
+   here", "여기 표시해줘", "위치 저장해".
+5. "Save" -- The user wants to attach a note / bookmark to the object.
+   Phrasings: "save this", "note this", "이거 메모해줘", "북마크".
+6. "Capture" -- The user wants to photograph / capture the target.
+   Phrasings: "take a picture of this", "capture this", "찍어줘",
+   "사진 저장".
+7. "Ask" -- ANY open-ended question that does not clearly fit the six
+   above. This is the fallback bucket. Phrasings: "how do I use this?",
+   "how much is it?", "이거 어떻게 써?", "얼마야?", "누가 만들었어?".
+
+===== Classification rules =====
+- Prefer one of the first six intents when the phrasing clearly matches.
+- If in doubt, choose "Ask". A study participant should never see a
+  mis-routed card just because the intent classifier was overconfident.
+- Answer in the SAME language the user spoke is NOT required here -- this
+  is a machine-readable classification, so intent must be the exact
+  canonical English string above.
+
+===== Save-specific extraction =====
+When and ONLY when the classified intent is "Save", also extract the note
+body from the transcript into a `note_content` field. Users often speak
+the note inline, e.g. "메모에 '내일 3시 회의' 라고 저장해줘" or
+"save a note that says buy milk". The note body is the actual content the
+user wants written on the sticky note -- NOT the wrapping command words.
+Guidelines:
+- Strip the wrapping verbs ("save", "note", "메모해줘", "저장해줘") and
+  the framing quotes ("라고", "as", "that says").
+- Preserve the note body in the user's original language.
+- If the transcript is a Save intent but has no clear note body (e.g. the
+  user just said "save this"), return an empty string for note_content --
+  the downstream flow will fall back to opening the manual input UI.
+- For every non-Save intent, omit `note_content` entirely (or leave it "").
+
+===== Output format (STRICT) =====
+Return EXACTLY one JSON object, no prose:
+
+{
+  "intent":       "<one of the seven canonical strings above>",
+  "confidence":   "high" | "medium" | "low",
+  "rationale":    "<brief English explanation, one short sentence>",
+  "note_content": "<Save intent only: the extracted note body, else empty string>"
+}
+
+===== User transcript =====
+"{transcript}"
+"""
+
+
+# DEPRECATED as of the 7-referent voice routing refactor. Voice queries now
+# go through voice_pipeline.dispatch(), which classifies the transcript with
+# VOICE_INTENT_PROMPT above and reuses the same YOLO+CLIP+DB handler as the
+# gesture path. For open-ended Ask fallback the handler chain uses
+# ASK_REFERENCE_PROMPT (see top of file).
+#
+# Kept here because it captures the GazePointAR Figure 8 structure with an
+# explicit gaze coordinate injection, which is a useful reference if we ever
+# want to run a single-call multimodal Voice mode again (e.g. for baseline
+# comparison in a follow-up study). Not imported anywhere at runtime.
 VOICE_COMMAND_PROMPT = """\
 You are a context-aware voice assistant for a user wearing an XR headset. The
 image below is a snapshot of the user's real-world field of view (passthrough

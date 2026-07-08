@@ -27,7 +27,7 @@ import threading
 import uuid
 from datetime import datetime
 
-from . import config, object_ui, state, vlm_client
+from . import object_ui, state, voice_pipeline
 from .network import process_ask_question, send_vlm_result_to_unity
 
 
@@ -213,6 +213,31 @@ def _remember_unity_host(host: str):
         state.last_unity_addr = (host, 0)
 
 
+def _extract_gaze_trail(payload: dict):
+    """Pull the parallel gaze_trail_x / gaze_trail_y arrays Unity ships in
+    the /voice_command body and zip them into a list of (nx, ny) tuples,
+    still in Unity's bottom-left origin. voice_pipeline flips the y axis to
+    the top-left origin the rest of the pipeline uses.
+
+    Returns None (not [] ) when the trail is missing or empty, so callers
+    can distinguish "user paused motionless" from "trail unavailable, fall
+    back to synth"."""
+    tx = payload.get("gaze_trail_x") or []
+    ty = payload.get("gaze_trail_y") or []
+    if not isinstance(tx, list) or not isinstance(ty, list):
+        return None
+    n = min(len(tx), len(ty))
+    if n <= 0:
+        return None
+    out = []
+    for i in range(n):
+        try:
+            out.append((float(tx[i]), float(ty[i])))
+        except (TypeError, ValueError):
+            continue
+    return out or None
+
+
 def _process_ask_transcript_async(transcript: str, request_id: str):
     """Pair an on-device STT transcript with the cached Ask target."""
     text = (transcript or "").strip()
@@ -233,78 +258,6 @@ def _process_ask_transcript_async(transcript: str, request_id: str):
 
     print(f"[ASK_VOICE] dispatching to Ask pipeline request_id={request_id!r} text={text!r}")
     process_ask_question(text)
-
-
-def _describe_gaze_region(nx: float, ny_topleft: float) -> str:
-    """Human-readable label for a normalised (top-left origin) point on the
-    frame. Feeds the prompt so GPT can double-check its own resolution
-    against a coarse spatial descriptor -- avoids "the model quoted a wrong
-    pixel" failures we hit when the coordinate alone was ambiguous."""
-    if nx < 0.33:
-        col = "left"
-    elif nx < 0.67:
-        col = "center"
-    else:
-        col = "right"
-    if ny_topleft < 0.33:
-        row = "top"
-    elif ny_topleft < 0.67:
-        row = "middle"
-    else:
-        row = "bottom"
-    if col == "center" and row == "middle":
-        return "dead center of the frame"
-    return f"{row}-{col} region of the frame"
-
-
-def _build_gaze_info_block(payload: dict, frame_w: int, frame_h: int) -> str:
-    """Translate Unity's gaze viewport (0..1, bottom-left origin) into a
-    text block for the prompt. Mirrors GazePointAR Figure 8's "gaze data"
-    section -- the reason we can disambiguate pronouns instead of guessing
-    at scene center."""
-    tracked = bool(payload.get("gaze_tracked"))
-    if not tracked:
-        return (
-            "No eye-tracking data was available at listen-start. Fall back "
-            "to the center of the frame as the presumed gaze target, but "
-            "flag lower confidence if the answer depends on the target."
-        )
-
-    try:
-        vp_x = float(payload.get("gaze_viewport_x") or 0.0)
-        vp_y_bl = float(payload.get("gaze_viewport_y") or 0.0)  # Unity: bottom-left origin
-    except (TypeError, ValueError):
-        return (
-            "Eye-tracking data was malformed. Fall back to the center of "
-            "the frame as the presumed gaze target."
-        )
-
-    vp_x = max(0.0, min(1.0, vp_x))
-    vp_y_bl = max(0.0, min(1.0, vp_y_bl))
-    # Convert to image (top-left origin) convention used by cv2/OpenAI.
-    ny_tl = 1.0 - vp_y_bl
-    px = int(round(vp_x * max(1, frame_w - 1)))
-    py = int(round(ny_tl * max(1, frame_h - 1)))
-    region = _describe_gaze_region(vp_x, ny_tl)
-
-    return (
-        f"The user's eye gaze at listen-start was tracked at pixel "
-        f"({px}, {py}) on the {frame_w}x{frame_h} frame -- normalised "
-        f"({vp_x:.3f}, {ny_tl:.3f}), which lands in the {region}. Treat "
-        f"whatever object occupies that pixel neighbourhood as the PRIMARY "
-        f"referent when resolving pronouns; only override if a clearly "
-        f"visible hand-pointing gesture aims somewhere else."
-    )
-
-
-def _extract_answer_text(gpt_response) -> str:
-    if not isinstance(gpt_response, dict):
-        return ""
-    for key in ("answer", "response", "text", "raw"):
-        value = gpt_response.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
 
 
 def _send_voice_command_error(request_id: str, transcript: str, message: str):
@@ -352,91 +305,41 @@ def _process_voice_command_async(payload: dict):
     h, w = image_bgr.shape[:2]
     print(f"[VOICE-COMMAND] request_id={request_id} source=ADB_stream frame={w}x{h}")
 
-    gaze_info_block = _build_gaze_info_block(payload, w, h)
-    prompt = (
-        config.VOICE_COMMAND_PROMPT
-        .replace("{transcript}", transcript)
-        .replace("{gaze_info}", gaze_info_block)
+    # Route through the shared voice pipeline:
+    # 1. GPT classifies the transcript into one of the 7 canonical referents
+    #    (Ask is the fallback bucket for open-ended questions).
+    # 2. The classified intent dispatches to the same YOLO+CLIP+DB handler
+    #    that the gesture path uses, so Voice-triggered runs surface the
+    #    same response cards (Search/Anchor/Save/etc.) as gestures do.
+    # 3. Ask specifically falls back to the two-phase handlers/ask.py +
+    #    network.process_ask_question chain so voice Ask == gesture Ask.
+    gaze_viewport_bl = None
+    if bool(payload.get("gaze_tracked")):
+        try:
+            gaze_viewport_bl = (
+                float(payload.get("gaze_viewport_x") or 0.0),
+                float(payload.get("gaze_viewport_y") or 0.0),
+            )
+        except (TypeError, ValueError):
+            gaze_viewport_bl = None
+
+    # Gaze trail buffered by Unity from listen-start through transcript-final.
+    # When present it wholly replaces the synthesised norm_points cluster --
+    # Python then sees the actual gaze span from the utterance, matching how
+    # gesture flow accumulates gesture_norm_points.
+    trail_bl = _extract_gaze_trail(payload)
+
+    intent, confidence, rationale = voice_pipeline.dispatch(
+        transcript=transcript,
+        frame_bgr=image_bgr,
+        gaze_viewport_bl=gaze_viewport_bl,
+        gaze_tracked=bool(payload.get("gaze_tracked")),
+        gaze_trail_bl=trail_bl,
+        request_id=request_id,
     )
-    gpt_response = vlm_client.call_vlm_on_crop(image_bgr, prompt)
-
-    referent_text = ""
-    confidence_text = ""
-    if gpt_response is None:
-        answer_text = ""
-        ok = False
-        error = "vlm_call_failed"
-        response_name = "Voice request"
-    elif isinstance(gpt_response, dict) and gpt_response.get("error"):
-        answer_text = ""
-        ok = False
-        error = str(gpt_response.get("error"))
-        response_name = str(gpt_response.get("name") or "Voice request")
-        referent_text = str(gpt_response.get("referent") or "")
-        confidence_text = str(gpt_response.get("confidence") or "")
-    else:
-        answer_text = _extract_answer_text(gpt_response)
-        ok = bool(answer_text)
-        error = "" if ok else "empty_answer"
-        if isinstance(gpt_response, dict):
-            response_name = str(gpt_response.get("name") or "Voice request")
-            referent_text = str(gpt_response.get("referent") or "")
-            confidence_text = str(gpt_response.get("confidence") or "")
-        else:
-            response_name = "Voice request"
-
-    target_meta = {
-        "source": "voice_adb_frame",
-        "user_question": transcript,
-        "image_width": int(image_bgr.shape[1]),
-        "image_height": int(image_bgr.shape[0]),
-        "screen_width": int(payload.get("screen_width") or 0),
-        "screen_height": int(payload.get("screen_height") or 0),
-        # Preserve the gaze cue so vlm_outputs/ retains it alongside the
-        # prompt/response -- important for post-hoc analysis of pronoun
-        # disambiguation, per GazePointAR's Study 2 evaluation approach.
-        "gaze_tracked": bool(payload.get("gaze_tracked")),
-        "gaze_viewport_x": float(payload.get("gaze_viewport_x") or 0.0),
-        "gaze_viewport_y_unity_bl": float(payload.get("gaze_viewport_y") or 0.0),
-    }
-
-    final_response = {
-        "name": response_name,
-        "answer": answer_text,
-        "user_question": transcript,
-        # GazePointAR-style extras: surfaces pronoun resolution + model
-        # confidence for study logging. Unity's ResultCardSpawner only reads
-        # `answer`/`name`; the rest is captured in vlm_outputs for analysis.
-        "referent": referent_text,
-        "confidence": confidence_text,
-    }
-    if not ok:
-        final_response["error"] = error
-
-    log_response = dict(final_response)
-    log_response["_gpt_raw"] = gpt_response
-    saved = vlm_client.save_vlm_response(
-        log_response, "VoiceAsk", target_meta, image_bgr, prompt
-    )
-
-    payload_out = {
-        "request_id": request_id,
-        "requestId": request_id,
-        "timestamp": saved.get("timestamp", "") if saved else "",
-        "gesture": "VoiceAsk",
-        "model": config.OPENAI_MODEL,
-        "status": "ok" if ok else "fail",
-        "stage": "answer",
-        "target_meta": target_meta,
-        "response": final_response,
-    }
-    if not ok:
-        payload_out["reason"] = error
-
-    send_vlm_result_to_unity(payload_out)
     print(
-        f"[VOICE-COMMAND] result sent request_id={request_id} "
-        f"status={payload_out['status']} answer_len={len(answer_text)}"
+        f"[VOICE-COMMAND] dispatched request_id={request_id} intent={intent!r} "
+        f"confidence={confidence} rationale={rationale!r}"
     )
 
 

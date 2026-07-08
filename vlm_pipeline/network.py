@@ -491,10 +491,53 @@ def _resolve_unity_host():
     return None
 
 
+def _stamp_voice_request_id(payload: dict):
+    """If a voice pipeline is active on this thread, copy its request_id +
+    gaze snapshot into the outgoing payload. Import locally to avoid a
+    circular import at module load time."""
+    if not isinstance(payload, dict):
+        return
+    try:
+        from . import voice_pipeline
+    except Exception:
+        return
+    ctx = voice_pipeline.current_context()
+    if ctx is None:
+        return
+    req_id = ctx.get("request_id")
+    if req_id and not payload.get("request_id"):
+        payload["request_id"] = req_id
+        payload.setdefault("requestId", req_id)
+    # Propagate the gaze pixel that seeded this run so vlm_outputs/ retains
+    # the pronoun-resolution provenance -- mirrors what GazePointAR logs.
+    tm = payload.get("target_meta")
+    if isinstance(tm, dict) and "voice_gaze_pixel_x" not in tm:
+        gaze_px = ctx.get("gaze_pixel")
+        if gaze_px is not None:
+            tm["voice_gaze_pixel_x"] = int(gaze_px[0])
+            tm["voice_gaze_pixel_y"] = int(gaze_px[1])
+            tm["voice_gaze_tracked"] = bool(ctx.get("gaze_tracked"))
+
+    # Save-specific: if the classifier parsed a note body out of the
+    # transcript ("~~라고 노트 저장해줘"), forward it in the response so
+    # Unity's NoteManager commits the StickyNote directly instead of opening
+    # the manual-input SaveNoteCard.
+    if payload.get("gesture") == "Save" and payload.get("status") != "fail":
+        note_content = ctx.get("note_content")
+        response = payload.get("response")
+        if note_content and isinstance(response, dict) and not response.get("note_text"):
+            response["note_text"] = note_content
+
+
 def send_vlm_result_to_unity(payload: dict):
     """Send the VLM result back to the Unity headset.
 
     Wire format (one UDP datagram, UTF-8):  VLM_RESULT|<json>
+
+    Voice-triggered handler runs stamp payloads with request_id via
+    voice_pipeline.current_request_id() so Unity's CaptureContextRegistry can
+    correlate the answer back to the pose registered at listen-start. Gesture
+    runs don't set it and the injection becomes a no-op.
     """
     if state.unity_sender_sock is None:
         print("[UNITY-SEND][WARN] sender socket not initialized; skipping.")
@@ -504,6 +547,8 @@ def send_vlm_result_to_unity(payload: dict):
     if host is None:
         print("[UNITY-SEND][WARN] no Unity host known yet (no inbound UDP seen). Skipping.")
         return
+
+    _stamp_voice_request_id(payload)
 
     try:
         body = json.dumps(payload, ensure_ascii=False)
