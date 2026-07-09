@@ -50,6 +50,13 @@ def is_ready() -> bool:
     return _ready
 
 
+def preload() -> bool:
+    """Force-load the depth model synchronously so the FIRST gesture doesn't
+    have to eat the ~1.5s transformers weights load. Safe to call multiple
+    times -- it's a no-op once _ready is set. Returns True on success."""
+    return _ensure_loaded()
+
+
 def _ensure_loaded() -> bool:
     global _model, _processor, _torch, _device, _dtype, _initialised, _ready
     if _ready:
@@ -86,7 +93,12 @@ def _ensure_loaded() -> bool:
         try:
             t0 = time.perf_counter()
             processor = AutoImageProcessor.from_pretrained(_model_id)
-            model = AutoModelForDepthEstimation.from_pretrained(_model_id, torch_dtype=dtype)
+            # transformers renamed torch_dtype -> dtype; try new form first and
+            # fall back for older wheels. Silences the deprecation warning.
+            try:
+                model = AutoModelForDepthEstimation.from_pretrained(_model_id, dtype=dtype)
+            except TypeError:
+                model = AutoModelForDepthEstimation.from_pretrained(_model_id, torch_dtype=dtype)
             model.to(device)
             model.eval()
             elapsed = time.perf_counter() - t0

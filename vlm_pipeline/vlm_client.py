@@ -21,6 +21,19 @@ except Exception as _openai_exc:
 from . import config
 
 
+# Ask pipeline: gpt-4o via the Responses API with the web_search_preview tool.
+# Bigger world knowledge than the mini models AND can fetch fresh info when the
+# question is beyond both the DB and the model's training data. First-token
+# ~500ms, ~40 tokens/sec streaming; web-search invocations add ~1-3s on top,
+# but only when the model decides it needs external info.
+ASK_STREAM_MODEL = "gpt-4o"
+
+# Translate pipeline: gpt-4o-mini via plain Chat Completions streaming.
+# Translation needs no world knowledge, so we prioritise raw speed here (first
+# token ~250ms, ~70 tokens/sec).
+TRANSLATE_STREAM_MODEL = "gpt-4o-mini"
+
+
 _openai_client = None
 
 
@@ -148,6 +161,119 @@ def translate_texts_to_korean(texts: list) -> list:
         return ["" for _ in texts]
 
 
+def translate_text_to_korean_stream(text: str, on_delta) -> str:
+    """Streaming translation of ONE source string to Korean.
+
+    on_delta(chunk_text) is invoked synchronously for every non-empty content
+    chunk arriving from OpenAI. The caller uses that hook to push a UDP
+    STREAM_DELTA packet to Unity so the card text visibly fills in.
+
+    Returns the concatenated final Korean text (or "" on failure).
+    """
+    if _openai_client is None:
+        print("[TRANSLATE][STREAM][ERROR] OpenAI client not initialized.")
+        return ""
+    if not text:
+        return ""
+
+    system_msg = (
+        "You are a translation engine. Translate the user's input to natural Korean. "
+        "Output only the Korean translation as plain text, nothing else -- no quotes, "
+        "no labels, no romanization."
+    )
+    try:
+        t0 = time.perf_counter()
+        stream = _openai_client.chat.completions.create(
+            model=TRANSLATE_STREAM_MODEL,
+            stream=True,
+            max_completion_tokens=400,
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": text},
+            ],
+        )
+        parts = []
+        first_ms = None
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta.content or ""
+            if not delta:
+                continue
+            if first_ms is None:
+                first_ms = (time.perf_counter() - t0) * 1000
+                print(f"[TRANSLATE][STREAM] first token in {first_ms:.0f}ms")
+            parts.append(delta)
+            try:
+                on_delta(delta)
+            except Exception as cb_exc:
+                print(f"[TRANSLATE][STREAM][WARN] on_delta raised: {cb_exc}")
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        full = "".join(parts)
+        print(
+            f"[TRANSLATE][STREAM] done in {elapsed_ms:.0f}ms "
+            f"first={first_ms:.0f}ms len={len(full)}"
+        )
+        return full
+    except Exception as exc:
+        print(f"[TRANSLATE][STREAM][ERROR] {exc}")
+        return ""
+
+
+def warm_up_stream_client() -> bool:
+    """Prime BOTH streaming paths (Ask via Responses API, Translate via Chat
+    Completions) with tiny dummy requests so the FIRST real gesture doesn't
+    eat the TLS handshake + cold-cache penalty. Runs from startup in a
+    background thread.
+
+    Returns True if AT LEAST ONE warm-up round-tripped. Failures per-model
+    are logged and swallowed so a broken tool config on one path can't stop
+    the other from warming.
+    """
+    if _openai_client is None:
+        return False
+    any_ok = False
+
+    # Translate path: Chat Completions.
+    try:
+        t0 = time.perf_counter()
+        stream = _openai_client.chat.completions.create(
+            model=TRANSLATE_STREAM_MODEL,
+            stream=True,
+            max_completion_tokens=1,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        for _ in stream:
+            pass
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"[VLM][WARMUP] {TRANSLATE_STREAM_MODEL} (chat) handshake+ping in {elapsed_ms:.0f}ms")
+        any_ok = True
+    except Exception as exc:
+        print(f"[VLM][WARMUP][WARN] {TRANSLATE_STREAM_MODEL}: {exc}")
+
+    # Ask path: Responses API. No tools attached -- warm-up shouldn't invoke
+    # web_search; we just want the connection primed and the Responses API
+    # code path exercised so the SDK's internal caches are ready.
+    try:
+        t0 = time.perf_counter()
+        stream = _openai_client.responses.create(
+            model=ASK_STREAM_MODEL,
+            stream=True,
+            max_output_tokens=1,
+            input="hi",
+        )
+        for _ in stream:
+            pass
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"[VLM][WARMUP] {ASK_STREAM_MODEL} (responses) handshake+ping in {elapsed_ms:.0f}ms")
+        any_ok = True
+    except Exception as exc:
+        print(f"[VLM][WARMUP][WARN] {ASK_STREAM_MODEL}: {exc}")
+
+    return any_ok
+
+
 def transcribe_audio_bytes(audio_bytes: bytes, file_format: str = "wav") -> str:
     """Send raw audio bytes to OpenAI Whisper. Returns transcribed text or '' on failure."""
     if _openai_client is None:
@@ -263,6 +389,89 @@ def call_vlm_on_crop(crop_bgr: np.ndarray, prompt: str):
     except Exception as exc:
         print(f"[VLM][ERROR] {exc}")
         return None
+
+
+def call_vlm_on_crop_stream(crop_bgr: np.ndarray, prompt: str, on_delta) -> str:
+    """Streaming vision Q&A over a crop + prompt, backed by the Responses API.
+
+    Uses the ``web_search_preview`` tool so the model can fetch external info
+    when the DB context + its training knowledge aren't enough (e.g. product
+    specs, recall status, current pricing). Web-search hops add ~1-3s but the
+    model only invokes the tool when it decides it needs to -- typical Q&A
+    stays on the fast path.
+
+    The prompt should ask for a PLAIN-TEXT answer (no JSON schema) because we
+    push deltas as they arrive; buffering a whole JSON would defeat streaming.
+
+    on_delta(chunk_text) fires synchronously for each text delta.
+    Returns the concatenated full text ("" on failure).
+    """
+    if _openai_client is None:
+        print("[VLM][STREAM][ERROR] OpenAI client not initialized.")
+        return ""
+    if crop_bgr is None or crop_bgr.size == 0:
+        return ""
+
+    try:
+        data_uri = _encode_image_to_data_uri(crop_bgr)
+    except Exception as exc:
+        print(f"[VLM][STREAM][ERROR] image encode failed: {exc}")
+        return ""
+
+    try:
+        t0 = time.perf_counter()
+        stream = _openai_client.responses.create(
+            model=ASK_STREAM_MODEL,
+            stream=True,
+            max_output_tokens=800,
+            tools=[{"type": "web_search_preview"}],
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": data_uri},
+                    ],
+                }
+            ],
+        )
+        parts = []
+        first_ms = None
+        web_search_calls = 0
+        for event in stream:
+            etype = getattr(event, "type", "") or ""
+            # Text deltas -- the primary path we care about.
+            if etype == "response.output_text.delta":
+                delta = getattr(event, "delta", "") or ""
+                if not delta:
+                    continue
+                if first_ms is None:
+                    first_ms = (time.perf_counter() - t0) * 1000
+                    print(f"[VLM][STREAM] first token in {first_ms:.0f}ms")
+                parts.append(delta)
+                try:
+                    on_delta(delta)
+                except Exception as cb_exc:
+                    print(f"[VLM][STREAM][WARN] on_delta raised: {cb_exc}")
+            # Web search invocation logs -- useful for judging if the model is
+            # actually consulting external sources or answering from priors.
+            elif etype in ("response.web_search_call.in_progress",
+                           "response.web_search_call.searching"):
+                web_search_calls += 1
+                print(f"[VLM][STREAM] web_search invoked (#{web_search_calls})")
+            elif etype == "response.error":
+                err = getattr(event, "error", None)
+                print(f"[VLM][STREAM][ERROR] stream error event: {err!r}")
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        full = "".join(parts)
+        print(
+            f"[VLM][STREAM] done in {elapsed_ms:.0f}ms "
+            f"first={first_ms:.0f}ms len={len(full)} web_search={web_search_calls}"
+        )
+        return full
+    except Exception as exc:
+        print(f"[VLM][STREAM][ERROR] {exc}")
+        return ""
 
 
 def save_vlm_response(

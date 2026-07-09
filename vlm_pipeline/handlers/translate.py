@@ -16,13 +16,14 @@ Splitting like this lets Unity show the OCR'd text immediately so the user
 can see WHAT will be translated before committing to the (slower) GPT call.
 """
 import time
+import uuid
 from datetime import datetime
 
 import cv2
 import numpy as np
 
 from .. import config, geometry, network, ocr, render, state, target_anchor
-from ..vlm_client import translate_texts_to_korean
+from ..vlm_client import translate_text_to_korean_stream
 from . import register
 
 
@@ -223,13 +224,37 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
         return overlay
 
     text = cached["text"]
-    koreans = translate_texts_to_korean([text])
-    ko = koreans[0] if koreans else ""
+    stream_id = uuid.uuid4().hex
+    target_meta = {
+        "source": "OCR",
+        "bbox": cached["bbox"],
+        "pick_mode": cached["pick_mode"],
+        "pick_score": cached["pick_score"],
+        "gaze_bbox": cached["gaze_bbox"],
+    }
+    seq_counter = [0]
 
-    print("[Translate] === translation result ===")
+    def _on_delta(chunk: str) -> None:
+        # First delta carries target_meta so Unity has enough context if the
+        # OCR-stage packet was somehow missed; subsequent deltas skip it to
+        # keep bytes down.
+        tm = target_meta if seq_counter[0] == 0 else None
+        network.send_stream_delta_to_unity(
+            stream_id=stream_id,
+            gesture=gesture_name,
+            delta=chunk,
+            stage="translation",
+            seq=seq_counter[0],
+            target_meta=tm,
+        )
+        seq_counter[0] += 1
+
+    ko = translate_text_to_korean_stream(text, _on_delta)
+
+    print("[Translate] === translation result (streamed) ===")
     print(f"  EN: {text}")
     print(f"  KO: {ko}")
-    print("[Translate] ===========================")
+    print("[Translate] ===================================")
 
     translation_response = {
         "name": text,
@@ -239,25 +264,18 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
     # same world position as the OCR preview did.
     target_anchor.merge_into_response(translation_response, cached.get("anchor") or {})
 
-    payload = {
-        "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3],
-        "gesture": gesture_name,
-        "stage": "translation",
-        "model": config.OPENAI_MODEL,
-        "status": "ok",
-        "target_meta": {
-            "source": "OCR",
-            "bbox": cached["bbox"],
-            "pick_mode": cached["pick_mode"],
-            "pick_score": cached["pick_score"],
-            "gaze_bbox": cached["gaze_bbox"],
-        },
-        "response": translation_response,
-    }
-    network.send_vlm_result_to_unity(payload)
+    network.send_stream_end_to_unity(
+        stream_id=stream_id,
+        gesture=gesture_name,
+        stage="translation",
+        status="ok" if ko else "fail",
+        response=translation_response,
+        target_meta=target_meta,
+        error="" if ko else "empty_translation",
+    )
 
     cv2.putText(
-        overlay, f"TRANSLATE done -> Unity (EN '{text[:30]}...' -> KO)",
+        overlay, f"TRANSLATE streamed -> Unity (EN '{text[:30]}...' -> KO)",
         (20, overlay.shape[0] - 30),
         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 220, 255), 2, cv2.LINE_AA,
     )
