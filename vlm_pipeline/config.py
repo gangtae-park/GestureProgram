@@ -15,10 +15,14 @@ VLM_PACKET_PREFIX = "VLM_RESULT"         # Unity-side filter / matching prefix
 
 
 # =================== Display / Canvas ===================
-LIVE_WINDOW = "Live Stream"
-TARGET_WINDOW = "Target Result"
+LIVE_WINDOW = "Live Stream"          # header label drawn on the left pane
+TARGET_WINDOW = "Target Result"      # header label drawn on the right pane
+COMBINED_WINDOW = "MacProgram"       # single OS window that holds both panes
 CANVAS_W, CANVAS_H = 1100, 1000
 STREAM_W, STREAM_H = 1100, 1000
+# Header bar height reserved at the top of each pane for the label -- keeps the
+# label text out of the actual canvas so gaze/target overlays stay unobstructed.
+PANE_HEADER_H = 32
 
 POINT_RADIUS = 8
 POINT_COLOR = (0, 0, 255)                # current gaze marker
@@ -116,19 +120,22 @@ ASK_REFERENCE_PROMPT = """\
 You are answering a user's open-ended question about a real-world object they pointed at in XR.
 The image is a tight crop around the object. The object has already been identified for you
 in a "DB info" block below -- treat that as authoritative ground truth and only fall back to
-the image for things the DB does not cover (colour, condition, position, etc.).
+the image for things the DB does not cover (colour, condition, position, etc.). If the DB and
+the image still aren't enough (e.g. the question is about specs, availability, recall status,
+or anything outside the DB), you may use the web_search tool to fetch external info.
 
-Respond ONLY with a single JSON object using this schema:
-
-{
-  "name": "<short object name -- prefer the DB name>",
-  "answer": "<answer to the question about the object>"
-}
+Output format (STRICT):
+- Respond with PLAIN TEXT only -- the answer itself, nothing else.
+- Do NOT wrap the answer in JSON, quotes, code fences, or any other envelope.
+- Do NOT prefix with labels like "answer:" or the object name.
+- The stream is rendered live in an XR card as tokens arrive, so any wrapper
+  characters would appear in the UI.
 
 Style:
-- Keep the tone natural and conversational, like answering a curious friend.
-- The 'answer' field must be a complete sentence.
-- If the question can't be answered from the DB or the image, say so plainly
+- Natural conversational Korean, complete sentence(s).
+- Concise -- one or two sentences is usually enough. Longer only when the
+  user's question genuinely calls for detail.
+- If the question can't be answered even with web search, say so plainly
   instead of guessing.
 """
 

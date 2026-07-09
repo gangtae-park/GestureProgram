@@ -8,6 +8,7 @@ import socket
 import subprocess
 import threading
 import time
+import uuid
 
 import numpy as np
 
@@ -358,35 +359,41 @@ def process_ask_question(question: str):
     else:
         known_block = ""
 
+    # Streaming prompt: PLAIN TEXT answer, no JSON schema. Deltas are pushed
+    # to Unity as they arrive, so any JSON envelope would break incremental
+    # display. Callers that need structured metadata (name, anchor) should
+    # read from the STREAM_END packet instead.
     prompt = (
         base_prompt
         + ("\n\n" if base_prompt else "")
         + (known_block + "\n" if known_block else "")
         + f"User question about the object:\n{question}\n\n"
-        + "Answer the user's question specifically. Respond in the JSON schema above."
+        + "Answer the user's question concisely in plain Korean text. "
+          "Do NOT wrap the answer in JSON or quotes -- just the answer itself."
     )
 
-    gpt_response = vlm_client.call_vlm_on_crop(crop, prompt)
-
-    # Build the *final* response Unity sees. Even if GPT misbehaves we still
-    # surface the DB name so the user-facing card always says the right object.
     db_name = matched_object.get("name", "") if matched_object else ""
+    stream_id = uuid.uuid4().hex
+    seq_counter = [0]
 
-    if gpt_response is None:
-        answer_text = ""
-        ok = False
-        error = "vlm_call_failed"
-    elif isinstance(gpt_response, dict) and gpt_response.get("error"):
-        answer_text = ""
-        ok = False
-        error = str(gpt_response.get("error"))
-    else:
-        answer_text = _extract_answer_text(gpt_response)
-        ok = bool(answer_text)
-        error = "" if ok else "empty_answer"
+    def _on_delta(chunk: str) -> None:
+        tm = target_meta if seq_counter[0] == 0 else None
+        send_stream_delta_to_unity(
+            stream_id=stream_id,
+            gesture=gesture_name,
+            delta=chunk,
+            stage="answer",
+            seq=seq_counter[0],
+            target_meta=tm,
+        )
+        seq_counter[0] += 1
+
+    answer_text = vlm_client.call_vlm_on_crop_stream(crop, prompt, _on_delta)
+    ok = bool(answer_text)
+    error = "" if ok else "empty_answer"
 
     final_response = {
-        "name": db_name or (gpt_response.get("name", "") if isinstance(gpt_response, dict) else ""),
+        "name": db_name,
         "answer": answer_text,
         "user_question": question,
     }
@@ -398,30 +405,28 @@ def process_ask_question(question: str):
     if not ok:
         final_response["error"] = error
 
-    payload = {
-        "timestamp": "",  # filled by save_vlm_response
-        "gesture": gesture_name,
-        "model": config.OPENAI_MODEL,
-        "status": "ok" if ok else "fail",
-        "stage": "answer",
-        "target_meta": target_meta,
-        "match_meta": match_meta,
-        "response": final_response,
-    }
-
-    # Persist for the audit trail (writes timestamp + the raw GPT response too).
+    # Persist the streamed answer alongside the crop for the audit trail. Wrap
+    # in a dict shape that save_vlm_response recognises (kept identical to the
+    # non-streaming path so downstream tooling doesn't care).
     log_response = dict(final_response)
-    log_response["_gpt_raw"] = gpt_response
+    log_response["_streamed"] = True
     saved = vlm_client.save_vlm_response(
         log_response, gesture_name, target_meta, crop, prompt
     )
-    if saved is not None:
-        payload["timestamp"] = saved.get("timestamp", "")
 
-    send_vlm_result_to_unity(payload)
+    send_stream_end_to_unity(
+        stream_id=stream_id,
+        gesture=gesture_name,
+        stage="answer",
+        status="ok" if ok else "fail",
+        response=final_response,
+        target_meta=target_meta,
+        match_meta=match_meta,
+        error=error,
+    )
     print(
-        f"[ASK_QUESTION] phase2 sent name={final_response['name']!r} "
-        f"answer_len={len(answer_text)} status={payload['status']}"
+        f"[ASK_QUESTION] phase2 STREAM done name={final_response['name']!r} "
+        f"answer_len={len(answer_text)} status={'ok' if ok else 'fail'}"
     )
 
 
@@ -573,3 +578,86 @@ def send_vlm_result_to_unity(payload: dict):
         )
     except Exception as exc:
         print(f"[UNITY-SEND][ERROR] sendto failed: {exc}")
+
+
+# ============ Streaming LLM output to Unity ============
+# Wire format matches the existing VLM_RESULT convention: one prefix, a pipe,
+# then a UTF-8 JSON body, all in a single UDP datagram.
+#   VLM_STREAM_DELTA|{"stream_id","gesture","stage","seq","delta", ...}
+#   VLM_STREAM_END  |{"stream_id","gesture","stage","status","response", ...}
+# The first delta of a stream may include a target_meta so Unity can spawn the
+# card before the END packet lands; subsequent deltas can omit it.
+STREAM_DELTA_PREFIX = "VLM_STREAM_DELTA"
+STREAM_END_PREFIX = "VLM_STREAM_END"
+
+
+def _send_prefixed_json(prefix: str, payload: dict) -> None:
+    if state.unity_sender_sock is None:
+        return
+    host = _resolve_unity_host()
+    if host is None:
+        return
+    _stamp_voice_request_id(payload)
+    try:
+        body = json.dumps(payload, ensure_ascii=False)
+    except Exception as exc:
+        print(f"[UNITY-SEND][ERROR] json encode failed ({prefix}): {exc}")
+        return
+    data = f"{prefix}|{body}".encode("utf-8")
+    try:
+        state.unity_sender_sock.sendto(data, (host, config.UNITY_RESULT_PORT))
+    except Exception as exc:
+        print(f"[UNITY-SEND][ERROR] sendto {prefix} failed: {exc}")
+
+
+def send_stream_delta_to_unity(
+    stream_id: str,
+    gesture: str,
+    delta: str,
+    stage: str,
+    seq: int,
+    target_meta: dict = None,
+) -> None:
+    """One incremental token/chunk of a streaming LLM response."""
+    payload = {
+        "stream_id": stream_id,
+        "gesture": gesture,
+        "stage": stage,
+        "seq": seq,
+        "delta": delta,
+    }
+    if target_meta:
+        payload["target_meta"] = target_meta
+    _send_prefixed_json(STREAM_DELTA_PREFIX, payload)
+
+
+def send_stream_end_to_unity(
+    stream_id: str,
+    gesture: str,
+    stage: str,
+    status: str,
+    response: dict,
+    target_meta: dict = None,
+    match_meta: dict = None,
+    error: str = "",
+) -> None:
+    """Terminator for a stream. Carries the final assembled response payload so
+    Unity can commit anchor / metadata that the deltas didn't include."""
+    payload = {
+        "stream_id": stream_id,
+        "gesture": gesture,
+        "stage": stage,
+        "status": status,
+        "response": response or {},
+    }
+    if target_meta:
+        payload["target_meta"] = target_meta
+    if match_meta:
+        payload["match_meta"] = match_meta
+    if error:
+        payload["error"] = error
+    _send_prefixed_json(STREAM_END_PREFIX, payload)
+    print(
+        f"[UNITY-SEND] STREAM_END gesture={gesture} stage={stage} status={status} "
+        f"stream_id={stream_id[:8]}"
+    )
