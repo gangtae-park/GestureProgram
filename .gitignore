@@ -10,6 +10,8 @@ __pycache__/
 
 # Auto-generated VLM/CLIP run logs
 vlm_outputs/
+pilot_data/
+calibration_eval/
 
 # CLIP embedding cache (regenerated on first run from object_db/images/)
 object_db/embeddings.npz
