@@ -1,4 +1,4 @@
-"""Handler for the 'Search/Find Info' gesture.
+"""Handler for the 'Search' gesture.
 
 CHI 2027 study version -- no GPT VLM. We have a fixed 3-object database; CLIP
 picks the best match and we ship the pre-authored info card straight to Unity.
@@ -35,10 +35,10 @@ def _persist(crop_bgr, target_meta, match_meta, payload):
     """Mirror the old vlm_outputs/ behaviour so we still have an audit trail."""
     os.makedirs(config.VLM_OUTPUT_DIR, exist_ok=True)
     timestamp = payload.get("timestamp") or datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-    base = os.path.join(config.VLM_OUTPUT_DIR, f"{timestamp}_Search_Find_Info")
+    base = os.path.join(config.VLM_OUTPUT_DIR, f"{timestamp}_Search")
     log = {
         "timestamp": timestamp,
-        "gesture": "Search/Find Info",
+        "gesture": "Search",
         "model": f"YOLO+CLIP({config.CLIP_MODEL_NAME})",
         "target_meta": target_meta,
         "match_meta": match_meta,
@@ -95,7 +95,7 @@ def _match_worker(crop_bgr, target_meta, gesture_name, anchor=None):
     network.send_vlm_result_to_unity(success_payload)
 
 
-@register("Search/Find Info")
+@register("Search")
 def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.ndarray:
     if captured_frame is None:
         return render.placeholder_canvas("No frame at gesture END")

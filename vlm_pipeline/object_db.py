@@ -8,7 +8,7 @@ On startup we:
      cached to object_db/embeddings.npz so subsequent launches skip the GPU pass
      unless an image is added/changed (we compare mtimes).
 
-At query time, the Search/Find Info handler calls:
+At query time, the Search handler calls:
     db = get_db()
     match = clip_matcher.match_against_db(query_emb, db)
 

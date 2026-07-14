@@ -17,7 +17,7 @@ from .vlm_client import _openai_client  # reuse the shared OpenAI client
 
 
 CANONICAL_INTENTS = (
-    "Search/Find Info",
+    "Search",
     "Ask",
     "Translate",
     "Compare",

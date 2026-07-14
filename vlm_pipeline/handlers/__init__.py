@@ -64,7 +64,7 @@ def dispatch_gesture(captured_frame, norm_points, gesture_name: str) -> np.ndarr
 
 # Import every handler module so its @register(...) calls execute on package load.
 # Add new handler imports here as you add gestures.
-from . import search_find_info  # noqa: E402, F401
+from . import search  # noqa: E402, F401
 from . import ask     # noqa: E402, F401
 from . import translate  # noqa: E402, F401
 from . import anchor  # noqa: E402, F401
