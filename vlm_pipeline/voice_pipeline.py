@@ -269,7 +269,7 @@ def _cache_open_frame_ask_target(frame_bgr, transcript: str, gaze_bbox):
 # Voice classifier returns the canonical Unity name; some Python handlers are
 # registered under a slightly longer key. Bridge them here.
 _INTENT_TO_HANDLER = {
-    "Search/Find Info": "Search/Find Info",
+    "Search":           "Search",
     "Translate":        "Translate",
     "Compare":          "Compare",
     "Anchor":           "Anchor",

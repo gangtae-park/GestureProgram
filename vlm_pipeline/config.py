@@ -48,6 +48,13 @@ def build_ffmpeg_cmd(width: int, height: int):
 
 
 # =================== Gaze / Gesture timing ===================
+# The adb screenrecord pipeline lags the UDP gaze/pose stream by ~8 frames
+# (~267ms @30fps, measured with pilot_data debug frames). Gaze that gets
+# MAPPED ONTO THE STREAMED SCREEN (live dot, gesture trail -> target bbox)
+# is therefore taken from this long ago, so it lines up with what the frame
+# actually shows. Gesture/pinch event flags are NOT delayed.
+GAZE_SCREEN_DELAY_S = 8.0 / 30.0
+
 GAZE_BBOX_PADDING = 10
 MIN_GAZE_POINTS_FOR_TARGET = 5
 CAPTURE_DELAY_AFTER_END = 0.3
@@ -149,7 +156,7 @@ Style:
 #
 # The intent names MUST match the strings that Unity's ResultCardSpawner
 # switches on (see ResultCardSpawner.HandleResult in Assets/Scripts/):
-#   "Search/Find Info", "Ask", "Translate", "Compare", "Anchor",
+#   "Search", "Ask", "Translate", "Compare", "Anchor",
 #   "Save", "Capture".
 VOICE_INTENT_PROMPT = """\
 You classify a voice command spoken by a user wearing an XR headset. The
@@ -157,7 +164,7 @@ user is looking at a real-world object and may want to do one of the
 following seven actions with it. Return EXACTLY the canonical intent name.
 
 ===== Canonical intents =====
-1. "Search/Find Info" -- The user wants factual info / description of the
+1. "Search" -- The user wants factual info / description of the
    object they are looking at. Typical phrasings: "what is this?", "tell me
    about this", "이거 뭐야?", "이게 뭔지 알려줘", "설명해줘".
 2. "Translate" -- The user wants text visible on/near the target translated.

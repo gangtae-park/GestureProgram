@@ -91,7 +91,7 @@ def _do_search(obj: dict, request_id: str):
         "result_search": obj.get("result_search", ""),
     }
     payload = _base_payload(
-        gesture="Search/Find Info",
+        gesture="Search",
         request_id=request_id,
         model_tag=f"OBJECT_ACTION+DB({obj.get('id')})",
         response=response,

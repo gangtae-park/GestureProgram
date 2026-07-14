@@ -1,4 +1,5 @@
 import threading
+from collections import deque
 
 # Signaled by main() in finally block; threads observe this to exit cleanly.
 stop_event = threading.Event()
@@ -11,8 +12,12 @@ latest_frame = None  # np.ndarray (STREAM_H, STREAM_W, 3) uint8 BGR | None
 
 # ---- Gaze + gesture state (mutated by udp_receiver_loop) ----
 gaze_lock = threading.Lock()
-latest_gaze_norm = None         # (norm_x, norm_y) | None
-latest_is_tracked = False
+latest_gaze_norm = None         # (norm_x, norm_y) | None -- DELAYED by config.GAZE_SCREEN_DELAY_S
+latest_is_tracked = False      # tracked flag of the delayed sample above
+# Raw (recv_time, tracked, norm) samples awaiting screen alignment: the adb
+# stream shows the world GAZE_SCREEN_DELAY_S ago, so screen-mapped gaze is
+# consumed from this buffer that much later. Guarded by gaze_lock.
+gaze_delay_buffer = deque()
 is_gesture_active = False
 gesture_name_active = None
 gesture_norm_points = []        # list[(nx, ny)] inside current START..END window

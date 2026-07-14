@@ -20,7 +20,7 @@ Implementation details live in the `vlm_pipeline/` package:
   ├── render.py         OpenCV drawing helpers
   └── handlers/
       ├── __init__.py            handler registry + dispatch_gesture()
-      ├── search_find_info.py    Search/Find Info  (YOLO -> CLIP -> DB lookup)
+      ├── search_find_info.py    Search  (YOLO -> CLIP -> DB lookup)
       ├── ask.py                 Ask  (YOLO crop cache; GPT runs on ASK_QUESTION)
       └── translate.py           Translate (OCR paragraph -> GPT translate)
 

@@ -178,15 +178,32 @@ def udp_receiver_loop(sock: socket.socket):
                 if tracked
                 else None
             )
+            now = time.time()
+            cutoff = now - config.GAZE_SCREEN_DELAY_S
             with state.gaze_lock:
-                state.latest_is_tracked = tracked
-                state.latest_gaze_norm = mapped
-                if (
-                    state.is_gesture_active
-                    and mapped is not None
-                    and not state.gaze_logging_frozen
-                ):
-                    state.gesture_norm_points.append(mapped)
+                # Screen-mapped gaze runs GAZE_SCREEN_DELAY_S behind real time
+                # so it lines up with the (laggy) adb frame content. New
+                # samples go into the buffer; the newest sample OLDER than the
+                # delay becomes the effective "current" gaze for everything
+                # screen-related (live dot, gesture trail). Gesture START/END
+                # flags below are handled immediately, so only the mapping is
+                # delayed -- exactly the frame-vs-pose skew we measured.
+                buf = state.gaze_delay_buffer
+                buf.append((now, tracked, mapped))
+                while len(buf) >= 2 and buf[1][0] <= cutoff:
+                    buf.popleft()
+                if buf[0][0] <= cutoff:
+                    _t, eff_tracked, eff_mapped = buf[0]
+                    state.latest_is_tracked = eff_tracked
+                    state.latest_gaze_norm = eff_mapped
+                    if (
+                        state.is_gesture_active
+                        and eff_mapped is not None
+                        and not state.gaze_logging_frozen
+                    ):
+                        state.gesture_norm_points.append(eff_mapped)
+                # else: not enough history yet (first ~250ms after startup);
+                # keep the previous effective values.
 
         elif ptype == "GESTURE_EVENT":
             evt = pkt["event_type"]
