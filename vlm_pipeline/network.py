@@ -13,6 +13,7 @@ import uuid
 import numpy as np
 
 from . import config, state
+from . import headcomp
 from . import ridge
 from . import vlm_client
 
@@ -26,9 +27,11 @@ def parse_packet(msg: str) -> dict:
     pt = parts[0]
 
     if pt == "GAZE":
-        if len(parts) != 7:
-            raise ValueError(f"GAZE expects 7 fields, got {len(parts)}")
-        return {
+        # 7 fields = legacy; 11 fields append the head (camera) world-rotation
+        # quaternion xyzw used for head-motion compensation of the gaze trail.
+        if len(parts) not in (7, 11):
+            raise ValueError(f"GAZE expects 7 or 11 fields, got {len(parts)}")
+        pkt = {
             "type": "GAZE",
             "seq": int(parts[1]),
             "sender_time": float(parts[2]),
@@ -36,7 +39,13 @@ def parse_packet(msg: str) -> dict:
             "gx": float(parts[4]),
             "gy": float(parts[5]),
             "gz": float(parts[6]),
+            "head_quat": None,
         }
+        if len(parts) == 11:
+            pkt["head_quat"] = (
+                float(parts[7]), float(parts[8]), float(parts[9]), float(parts[10])
+            )
+        return pkt
 
     if pt == "GESTURE_EVENT":
         if len(parts) != 5:
@@ -128,6 +137,17 @@ def stream_reader_loop():
                 )
                 with state.frame_lock:
                     state.latest_frame = arr
+                # Delay-aligned gesture-start capture: the first frame arriving
+                # after START + GAZE_SCREEN_DELAY_S shows the world at the
+                # START instant -- that is the targeting frame.
+                with state.gaze_lock:
+                    if (
+                        state.gesture_start_capture_due is not None
+                        and time.time() >= state.gesture_start_capture_due
+                    ):
+                        state.gesture_start_frame = arr.copy()
+                        state.gesture_start_capture_due = None
+                        print("[GESTURE] start frame captured (delay-aligned)")
         except Exception as exc:
             print(f"[STREAM][ERROR] {exc}")
         finally:
@@ -180,30 +200,45 @@ def udp_receiver_loop(sock: socket.socket):
             )
             now = time.time()
             cutoff = now - config.GAZE_SCREEN_DELAY_S
+            head_r = (
+                headcomp.quat_to_matrix(*pkt["head_quat"])
+                if pkt.get("head_quat") is not None
+                else None
+            )
             with state.gaze_lock:
                 # Screen-mapped gaze runs GAZE_SCREEN_DELAY_S behind real time
-                # so it lines up with the (laggy) adb frame content. New
-                # samples go into the buffer; the newest sample OLDER than the
-                # delay becomes the effective "current" gaze for everything
-                # screen-related (live dot, gesture trail). Gesture START/END
-                # flags below are handled immediately, so only the mapping is
-                # delayed -- exactly the frame-vs-pose skew we measured.
+                # so it lines up with the (laggy) adb frame content. The buffer
+                # also remembers each sample's head pose so a gesture START can
+                # grab the pose matching the frame it snapshots.
                 buf = state.gaze_delay_buffer
-                buf.append((now, tracked, mapped))
+                buf.append((now, tracked, mapped, head_r))
                 while len(buf) >= 2 and buf[1][0] <= cutoff:
                     buf.popleft()
                 if buf[0][0] <= cutoff:
-                    _t, eff_tracked, eff_mapped = buf[0]
+                    _t, eff_tracked, eff_mapped, _r = buf[0]
                     state.latest_is_tracked = eff_tracked
                     state.latest_gaze_norm = eff_mapped
+
+                if state.is_gesture_active and not state.gaze_logging_frozen:
                     if (
-                        state.is_gesture_active
-                        and eff_mapped is not None
-                        and not state.gaze_logging_frozen
+                        config.ENABLE_HEAD_COMPENSATION
+                        and head_r is not None
+                        and state.gesture_start_head_R is not None
                     ):
-                        state.gesture_norm_points.append(eff_mapped)
-                # else: not enough history yet (first ~250ms after startup);
-                # keep the previous effective values.
+                        # Head-comp path: the CURRENT (undelayed) sample is
+                        # re-projected into the gesture-start frame's pose, so
+                        # the whole trail lives in one frame's pixel space.
+                        if mapped is not None:
+                            comp = headcomp.reproject_norm(
+                                mapped, head_r, state.gesture_start_head_R
+                            )
+                            if comp is not None:
+                                state.gesture_norm_points.append(comp)
+                    else:
+                        # Legacy path (old Unity sender / comp disabled): append
+                        # the DELAYED sample as before.
+                        if buf[0][0] <= cutoff and buf[0][1] and buf[0][2] is not None:
+                            state.gesture_norm_points.append(buf[0][2])
 
         elif ptype == "GESTURE_EVENT":
             evt = pkt["event_type"]
@@ -229,6 +264,28 @@ def udp_receiver_loop(sock: socket.socket):
                     state.gesture_name_active = pkt["gesture_name"]
                     state.gesture_norm_points = []
                     state.gaze_logging_frozen = False
+                    # Schedule the targeting frame: the frame showing the
+                    # world AT this instant only ARRIVES GAZE_SCREEN_DELAY_S
+                    # from now (adb pipeline lag), so the stream thread
+                    # fulfils the capture then. Grabbing latest_frame here
+                    # would freeze the world from 267ms BEFORE the gesture --
+                    # often mid-head-turn, with the target off-center.
+                    # Reference pose = head pose NOW (matches that future
+                    # frame's content); trail samples re-project into it.
+                    if config.ENABLE_HEAD_COMPENSATION:
+                        state.gesture_start_frame = None
+                        state.gesture_start_capture_due = (
+                            time.time() + config.GAZE_SCREEN_DELAY_S
+                        )
+                        ref_r = None
+                        for entry in reversed(state.gaze_delay_buffer):
+                            if entry[3] is not None:
+                                ref_r = entry[3]
+                                break
+                        state.gesture_start_head_R = ref_r
+                        if ref_r is None:
+                            print("[GESTURE][WARN] no head pose yet at START "
+                                  "-- will fall back to END capture.")
                     print(
                         f"\n[GESTURE] START name={state.gesture_name_active} "
                         f"seq={pkt['seq']}"
@@ -254,11 +311,24 @@ def udp_receiver_loop(sock: socket.socket):
                         f"(start_name={state.gesture_name_active}) "
                         f"seq={pkt['seq']} pts={len(state.gesture_norm_points)}"
                     )
+                    # For gestures shorter than the pipeline delay the start
+                    # frame may still be in flight; ready_at (END + 0.3s) is
+                    # always past due_at, so the main loop can collect it at
+                    # dispatch time via await_start_frame.
                     state.pending_gesture_end = {
                         "gesture_name": end_name,
                         "norm_points": list(state.gesture_norm_points),
                         "ready_at": time.time() + config.CAPTURE_DELAY_AFTER_END,
+                        "start_frame": state.gesture_start_frame,
+                        "await_start_frame": (
+                            state.gesture_start_frame is None
+                            and state.gesture_start_capture_due is not None
+                        ),
                     }
+                    if state.gesture_start_frame is not None:
+                        state.gesture_start_frame = None
+                        state.gesture_start_capture_due = None
+                    state.gesture_start_head_R = None
                     state.is_gesture_active = False
                     state.gesture_name_active = None
                     state.gesture_norm_points = []
@@ -270,6 +340,9 @@ def udp_receiver_loop(sock: socket.socket):
                         f"seq={pkt['seq']} pts={len(state.gesture_norm_points)}"
                     )
                     state.pending_gesture_end = None
+                    state.gesture_start_frame = None
+                    state.gesture_start_capture_due = None
+                    state.gesture_start_head_R = None
                     state.last_gesture_fail = {
                         "gesture_name": failed_name,
                         "reason": "Gesture failed or hand tracking lost",

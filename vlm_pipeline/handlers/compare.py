@@ -160,38 +160,80 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
     pixel_points = geometry.project_norm_points(norm_points, captured_frame.shape)
     gaze_bbox = geometry.compute_gaze_bbox(pixel_points, captured_frame.shape)
 
-    if gaze_bbox is None:
+    # ---- Fixation clustering ----
+    # A C->A sweep drags the gaze straight across whatever sits between the
+    # two targets; a single trail-wide bbox would hand that middle object a
+    # big IoU. So: keep only the dwell clusters, drop the transit points, and
+    # give each of the two dominant clusters its OWN bbox + YOLO match.
+    clusters = geometry.cluster_fixations(
+        pixel_points, config.COMPARE_CLUSTER_RADIUS_PX, config.COMPARE_CLUSTER_MIN_POINTS
+    )
+    if len(clusters) < 2:
         empty = render.render_compare_overlay(
-            captured_frame, pixel_points, None, [], [], gesture_name
+            captured_frame, pixel_points, gaze_bbox, [], [], gesture_name
         )
         cv2.putText(
-            empty, f"NOT ENOUGH GAZE POINTS ({len(pixel_points)})",
+            empty, f"NEED TWO GAZE CLUSTERS (got {len(clusters)}, {len(pixel_points)} pts)",
             (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, config.TRAIL_COLOR, 2, cv2.LINE_AA,
         )
-        _fail(gesture_name, "Not enough gaze points for Compare.", {"gaze_bbox": None})
+        _fail(
+            gesture_name,
+            f"Compare needs two gaze fixation clusters; got {len(clusters)}.",
+            {"gaze_bbox": None if gaze_bbox is None else list(gaze_bbox)},
+        )
         return empty
 
-    # ---- YOLO: pick the two segments best overlapping the gaze bbox ----
-    yolo_items = segmentation.run_yolo(captured_frame)
-    top = (
-        geometry.pick_top_overlaps(gaze_bbox, yolo_items, top_n=config.COMPARE_TOP_N)
-        if yolo_items else []
+    # Two largest dwell clusters, ordered by WHEN they were looked at so
+    # target #1 is the first-gazed object.
+    top_clusters = sorted(clusters[:2], key=lambda c: c["first_index"])
+    cluster_bboxes = [
+        geometry.compute_gaze_bbox(c["points"], captured_frame.shape) for c in top_clusters
+    ]
+    dropped = len(pixel_points) - sum(len(c["points"]) for c in clusters)
+    print(
+        f"[COMPARE][CLUSTER] {len(clusters)} clusters "
+        f"(sizes={[len(c['points']) for c in clusters]}), transit points dropped={dropped}"
     )
 
+    # ---- YOLO: each cluster picks its own best-overlapping segment ----
+    yolo_items = segmentation.run_yolo(captured_frame)
     targets = []
-    for idx, overlap, iou in top:
+    taken = set()
+    for slot, cbox in enumerate(cluster_bboxes):
+        if cbox is None or not yolo_items:
+            continue
+        ranked = geometry.pick_top_overlaps(cbox, yolo_items, top_n=len(yolo_items))
+        pick = next(((i, ov, iou) for (i, ov, iou) in ranked if i not in taken), None)
+        if pick is None:
+            print(f"[COMPARE][YOLO] cluster #{slot + 1} has no overlapping segment (bbox={cbox})")
+            continue
+        idx, overlap, iou = pick
+        taken.add(idx)
         chosen = dict(yolo_items[idx])
         chosen["best_overlap"] = overlap
         chosen["best_iou"] = iou
+        chosen["cluster_bbox"] = list(cbox)
+        chosen["cluster_points"] = len(top_clusters[slot]["points"])
         targets.append(chosen)
         print(
             f"[COMPARE][YOLO] target #{len(targets)} | class={chosen['class_name']} "
-            f"conf={chosen['conf']:.2f} overlap={overlap:.2f} iou={iou:.2f} bbox={chosen['bbox']}"
+            f"conf={chosen['conf']:.2f} overlap={overlap:.2f} iou={iou:.2f} bbox={chosen['bbox']} "
+            f"cluster_pts={chosen['cluster_points']}"
         )
 
     overlay = render.render_compare_overlay(
         captured_frame, pixel_points, gaze_bbox, targets, yolo_items, gesture_name
     )
+    # Draw each cluster's own bbox in its slot colour on top of the standard overlay.
+    for slot, cbox in enumerate(cluster_bboxes):
+        if cbox is None:
+            continue
+        color = config.COMPARE_TARGET_COLORS[slot % len(config.COMPARE_TARGET_COLORS)]
+        cv2.rectangle(overlay, (cbox[0], cbox[1]), (cbox[2], cbox[3]), color, 2)
+        cv2.putText(
+            overlay, f"gaze #{slot + 1}", (cbox[0], max(14, cbox[1] - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA,
+        )
 
     if len(targets) < 2:
         cv2.putText(

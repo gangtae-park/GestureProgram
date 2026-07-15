@@ -33,6 +33,55 @@ def compute_gaze_bbox(pixel_points, frame_shape):
     return int(x1), int(y1), int(x2), int(y2)
 
 
+def cluster_fixations(pixel_points, radius_px, min_points):
+    """Split a gaze trail into fixation clusters and drop saccade transit.
+
+    Sequential dispersion clustering: a point joins the current cluster while
+    it stays within radius_px of the cluster's running centroid; otherwise a
+    new cluster starts. Clusters whose centroids fall within radius_px of an
+    earlier cluster are merged (gaze revisits). Clusters smaller than
+    min_points -- the isolated points produced while the eye travels between
+    targets -- are discarded.
+
+    Returns a list of dicts {points, first_index, centroid}, largest first.
+    """
+    raw = []
+    cur = None
+    for i, p in enumerate(pixel_points):
+        if cur is not None:
+            cx, cy = cur["centroid"]
+            if ((p[0] - cx) ** 2 + (p[1] - cy) ** 2) ** 0.5 <= radius_px:
+                cur["points"].append(p)
+                n = len(cur["points"])
+                cur["centroid"] = (cx + (p[0] - cx) / n, cy + (p[1] - cy) / n)
+                continue
+            raw.append(cur)
+        cur = {"points": [p], "first_index": i, "centroid": (float(p[0]), float(p[1]))}
+    if cur is not None:
+        raw.append(cur)
+
+    merged = []
+    for c in raw:
+        target = None
+        for m in merged:
+            mx, my = m["centroid"]
+            cx, cy = c["centroid"]
+            if ((mx - cx) ** 2 + (my - cy) ** 2) ** 0.5 <= radius_px:
+                target = m
+                break
+        if target is None:
+            merged.append(c)
+        else:
+            target["points"].extend(c["points"])
+            xs = [q[0] for q in target["points"]]
+            ys = [q[1] for q in target["points"]]
+            target["centroid"] = (sum(xs) / len(xs), sum(ys) / len(ys))
+
+    kept = [c for c in merged if len(c["points"]) >= min_points]
+    kept.sort(key=lambda c: len(c["points"]), reverse=True)
+    return kept
+
+
 def bbox_iou(a, b):
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
