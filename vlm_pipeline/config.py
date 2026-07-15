@@ -55,9 +55,27 @@ def build_ffmpeg_cmd(width: int, height: int):
 # actually shows. Gesture/pinch event flags are NOT delayed.
 GAZE_SCREEN_DELAY_S = 8.0 / 30.0
 
+# Head-rotation compensated targeting: freeze the frame at gesture START and
+# re-project the whole gesture's gaze trail into that frame's camera pose
+# (see headcomp.py). Requires the 11-field GAZE packet (head quaternion) from
+# Unity; old 7-field senders automatically fall back to the legacy behaviour
+# (END-frame capture, uncompensated trail).
+ENABLE_HEAD_COMPENSATION = True
+HEADCOMP_FX, HEADCOMP_FY = 729.0, -665.0
+HEADCOMP_CX, HEADCOMP_CY = 575.0, 501.0
+
 GAZE_BBOX_PADDING = 10
-MIN_GAZE_POINTS_FOR_TARGET = 5
-CAPTURE_DELAY_AFTER_END = 0.3
+
+# Compare fixation clustering: a C->A gaze sweep drags points across whatever
+# sits between the two targets, and a single trail-wide bbox would credit that
+# middle object with a big IoU. Compare therefore clusters the trail into
+# dwell groups (sequential points within RADIUS of the running centroid, with
+# revisit merging), DROPS transit points, and matches each of the two largest
+# clusters to its own YOLO box.
+COMPARE_CLUSTER_RADIUS_PX = 80
+COMPARE_CLUSTER_MIN_POINTS = 3
+MIN_GAZE_POINTS_FOR_TARGET = 3
+CAPTURE_DELAY_AFTER_END = 0.0
 
 TARGET_SCORE_IOU_WEIGHT = 0.999
 TARGET_MIN_OVERLAP = 0.03

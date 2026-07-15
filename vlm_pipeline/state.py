@@ -23,7 +23,11 @@ gesture_name_active = None
 gesture_norm_points = []        # list[(nx, ny)] inside current START..END window
 gaze_logging_frozen = False     # Compare: True after a READY marker -> stop appending gaze
                                 # (the "bring hands together" motion must not pollute the trail)
-pending_gesture_end = None      # dict {gesture_name, norm_points, ready_at}, consumed by main loop
+gesture_start_frame = None      # BGR frame showing the world AT gesture START (head-comp targeting)
+gesture_start_capture_due = None  # wall time when the delay-aligned start frame arrives; the
+                                  # stream thread fulfils it into gesture_start_frame
+gesture_start_head_R = None     # 3x3 head rotation at gesture START (matches that frame's content)
+pending_gesture_end = None      # dict {gesture_name, norm_points, ready_at, start_frame}, consumed by main loop
 last_gesture_fail = None        # dict {gesture_name, reason, fail_time}, consumed by main loop
 
 
