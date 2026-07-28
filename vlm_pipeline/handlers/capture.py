@@ -1,6 +1,7 @@
-"""Handler for the 'Capture' gesture (camera-frame hand pose, both hands).
+"""
+Handler for the 'Capture' gesture (camera-frame hand pose, both hands).
 
-Pipeline (identical to Anchor / Save -- "identify the gazed object and ack"):
+Pipeline:
   1. Build the gaze bbox from the gesture-window gaze trail.
   2. Run YOLO; pick the segment whose bbox best overlaps the gaze.
   3. CLIP-embed the (optionally masked) crop and look it up in the 3-object DB.
@@ -20,7 +21,11 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from .. import clip_matcher, config, geometry, network, render, segmentation, target_anchor
+from .. import config
+from ..gaze import geometry
+from ..ui import render
+from ..unity import network
+from ..vision import clip_matcher, segmentation, target_anchor
 from . import register
 
 

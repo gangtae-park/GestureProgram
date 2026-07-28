@@ -8,10 +8,17 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Auto-generated VLM/CLIP run logs
+# Auto-generated directories
 vlm_outputs/
 pilot_data/
 calibration_eval/
+study_result/
 
 # CLIP embedding cache (regenerated on first run from object_db/images/)
 object_db/embeddings.npz
+
+# Model weights auto-downloaded by ultralytics on first run
+# (yolov8n-seg.pt/.onnx were committed before this rule and stay tracked)
+yoloe-*.pt
+yolov*.pt
+mobileclip_blt.ts

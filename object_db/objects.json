@@ -1,28 +1,74 @@
 {
   "objects": [
     {
-      "id": "object_a",
-      "name": "로지텍 M650",
-      "result_search": "•가격: 약 48,000원\n•센서 해상도: 400 DPI\n•배터리: AA 배터리 1개"
+      "id": "can_a",
+      "name": "에스앤더블유 키드니빈스",
+      "result_search": "•가격: 3,610원\n•용량: 400g\n•원산지: 이탈리아"
     },
     {
-      "id": "object_b",
-      "name": "로지텍 M720",
-      "result_search": "•가격: 약 50,000원\n•센서 해상도: 1000 DPI\n•배터리: AA 배터리 1개"
+      "id": "can_b",
+      "name": "하인즈 베이크드 빈즈",
+      "result_search": "•가격: 3,280원\n•용량: 415g\n•원산지: 뉴질랜드"
     },
     {
-      "id": "object_c",
-      "name": "허먼 밀러 SAYL 체어",
-      "result_search": "•가격: 약 1,500,000원\n•특징: 3D 인텔리전트 서스펜션 후면 구조, POSTUREFIT 척추 지지 기능, 조화로운 틸팅 기능"
+      "id": "can_c",
+      "name": "디벨라 칙피스(병아리콩)",
+      "result_search": "•가격: 2,770원\n•용량: 400g\n•원산지: 이탈리아"
+    },
+    {
+      "id": "text_a",
+      "name": "Text Box A",
+      "text_original": "PRODOTTO IPOSODICO",
+      "result_translate": "저나트륨 제품"
+    },
+    {
+      "id": "text_b",
+      "name": "Text Box B",
+      "text_original": "DIETA IPOGLICIDICA",
+      "result_translate": "저탄수화물 식단"
+    },
+    {
+      "id": "text_c",
+      "name": "Text Box C",
+      "text_original": "REGIME IPOLIPIDICO",
+      "result_translate": "저지방 식단"
+    },
+    {
+      "id": "plant",
+      "name": "데이지꽃 화분"
+    },
+    {
+      "id": "book",
+      "name": "KiCad6 책"
+    },
+    {
+      "id": "tumbler",
+      "name": "스타벅스 텀블러"
     }
   ],
   "comparisons": [
     {
-      "pair": ["object_a", "object_b"],
+      "pair": ["can_a", "can_b"],
       "result": [
-        { "category": "가격",       "object_a": "약 48,000원", "object_b": "약 50,000원" },
-        { "category": "센서 해상도", "object_a": "400 DPI",    "object_b": "1000 DPI" },
-        { "category": "배터리",     "object_a": "AA 1개",      "object_b": "AA 1개" }
+        { "category": "가격",       "can_a": "3,610원",       "can_b": "3,280원" },
+        { "category": "용량",       "can_a": "400g",         "can_b": "415g" },
+        { "category": "원산지",     "can_a": "이탈리아",        "can_b": "뉴질랜드" }
+      ]
+    },
+    {
+      "pair": ["can_b", "can_c"],
+      "result": [
+        { "category": "가격",       "can_b": "3,280원",       "can_c": "2,770원" },
+        { "category": "용량",       "can_b": "415g",         "can_c": "400g" },
+        { "category": "원산지",     "can_b": "뉴질랜드",        "can_c": "이탈리아" }
+      ]
+    },
+    {
+      "pair": ["can_c", "can_a"],
+      "result": [
+        { "category": "가격",       "can_c": "2,770원",       "can_a": "3,610원" },
+        { "category": "용량",       "can_c": "400g",         "can_a": "400g" },
+        { "category": "원산지",     "can_c": "이탈리아",        "can_a": "이탈리아" }
       ]
     }
   ]

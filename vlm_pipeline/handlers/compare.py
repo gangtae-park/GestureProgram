@@ -21,15 +21,11 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from .. import (
-    clip_matcher,
-    config,
-    geometry,
-    network,
-    object_db,
-    render,
-    segmentation,
-)
+from .. import config
+from ..gaze import geometry
+from ..ui import render
+from ..unity import network
+from ..vision import clip_matcher, object_db, segmentation
 from . import register
 
 

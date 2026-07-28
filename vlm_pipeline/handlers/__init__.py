@@ -1,31 +1,17 @@
-"""Gesture handler registry + dispatcher.
-
-To add a new gesture:
-  1. Create a new file in this folder (e.g. `compare.py`).
-  2. Define a function with signature
-        def handle(captured_frame, norm_points, gesture_name) -> np.ndarray
-     where the return value is the rendered overlay BGR for the target window.
-     Long-running work (segmentation, VLM, network) should run synchronously
-     here OR be dispatched to a daemon thread that updates state.target_canvas.
-  3. Decorate it with @register("Gesture/Name") -- the name must match the
-     `gestureName` Unity sends in GESTURE_EVENT.
-  4. Import the new module from this __init__.py so its decorator runs.
-
-The main loop calls dispatch_gesture(...) which routes by gesture name.
-Unknown names fall through to a default placeholder so the system keeps running.
+"""
+Gesture handler registry + dispatcher.
+The main loop calls dispatch_gesture which routes by gesture name.
 """
 from typing import Callable
 
 import numpy as np
 
-from .. import render
+from ..ui import render
 
-# Registry: gesture_name -> handler function
 _HANDLERS: dict = {}
 
-
 def register(name: str) -> Callable:
-    """Decorator: registers a handler for the given gesture name."""
+    """Registers a handler for the given gesture name."""
     def _decorator(fn: Callable) -> Callable:
         if name in _HANDLERS:
             print(f"[HANDLER][WARN] overriding existing handler for '{name}'")
@@ -62,12 +48,11 @@ def dispatch_gesture(captured_frame, norm_points, gesture_name: str) -> np.ndarr
     return handler(captured_frame, norm_points, gesture_name)
 
 
-# Import every handler module so its @register(...) calls execute on package load.
-# Add new handler imports here as you add gestures.
-from . import search  # noqa: E402, F401
-from . import ask     # noqa: E402, F401
-from . import translate  # noqa: E402, F401
-from . import anchor  # noqa: E402, F401
-from . import compare  # noqa: E402, F401
-from . import save  # noqa: E402, F401
-from . import capture  # noqa: E402, F401
+# Import every handler module so its @register calls execute on package load.
+from . import search
+from . import ask
+from . import translate
+from . import anchor
+from . import compare
+from . import save
+from . import capture

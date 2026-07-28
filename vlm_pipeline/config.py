@@ -94,8 +94,20 @@ RIDGE_MODEL_ABS_PATH = os.path.join(_PARENT_DIR, RIDGE_MODEL_PATH)
 # =================== YOLO ===================
 SEG_CONF = 0.15
 SEG_IOU_THRESH = 0.50
-SEG_MODEL_PATH = "yolov8n-seg.pt"
-MAX_SEGMENTS_TO_RENDER = 80         # Cap drawn boxes only; scoring still uses all
+# YOLOE (open-vocabulary): detects only the classes named in
+# SEG_PROMPT_CLASSES below. To roll back to the closed-set COCO model,
+# set SEG_MODEL_PATH back to "yolov8s-seg.pt" (prompts are then ignored).
+SEG_MODEL_PATH = "yoloe-11s-seg.pt"
+SEG_PROMPT_CLASSES = [
+    "canned food",
+    "tin can",
+    "bottle",
+    "cup",
+    "document",
+    "book",
+    "houseplant",
+]
+MAX_SEGMENTS_TO_RENDER = 15         # Cap drawn boxes only; scoring still uses all
 
 
 # =================== CLIP + object DB ===================
@@ -129,6 +141,21 @@ VLM_OUTPUT_DIR = os.path.join(_PARENT_DIR, "vlm_outputs")
 VLM_REQUEST_TIMEOUT_SEC = 30
 VLM_MAX_OUTPUT_TOKENS = 2000
 VLM_REASONING_EFFORT = "low"
+
+# Voice Input mode: latency matters (user is waiting mid-conversation), so it
+# uses a fast non-reasoning multimodal model and downscales the frame before
+# the GPT call (fewer image tokens; YOLO/CLIP still run on the full frame).
+VOICE_OPENAI_MODEL = "gpt-4o"
+VOICE_IMAGE_MAX_SIDE = 768
+
+
+# =================== User study: response-latency equalisation ===========
+# UI (XR-Objects) answers from a prepaid DB lookup in ~10 ms while Gesture
+# pays YOLO + CLIP (~1.3 s) at query time. So that response latency does not
+# confound the UX comparison, the UI action path HOLDS its result until this
+# many seconds have passed since the menu click, matching Gesture's typical
+# system time. Set 0 to disable.
+UI_RESULT_DELAY_S = 1.0
 
 
 # =================== OCR / Translate ===================
@@ -164,146 +191,94 @@ Style:
   instead of guessing.
 """
 
-# -------- Voice intent classifier --------
-# The voice mode used to always call GPT with a free-form Q&A prompt. That
-# meant a Voice user could never trigger the same DB-backed cards that
-# gesture / UI users see (Search, Anchor, Save, Compare, Translate, Capture).
-# This classifier picks the closest of the 7 canonical referents; anything
-# unclear falls through to Ask, which is the open-ended fallback per the
-# study design.
+# -------- Voice command: GazePointAR-style single multimodal call --------
+# Voice Input mode: question end -> scene + gaze captured -> YOLO picks the
+# segment at the gaze pixel and CLIP matches it against object_db -> ONE GPT
+# call carrying the frame, the gaze pixel ({gaze_info}), the DB lookup result
+# ({db_info}, authoritative ground truth when matched), and the verbatim
+# transcript. The model classifies the 7-way intent and answers grounded in
+# the DB fields; Unity's ResultCardSpawner spawns the card for that intent.
+# (A lookup∥GPT parallel variant was tried and reverted: without {db_info}
+# in the prompt, Ask answers lose their grounding.)
 #
 # The intent names MUST match the strings that Unity's ResultCardSpawner
 # switches on (see ResultCardSpawner.HandleResult in Assets/Scripts/):
-#   "Search", "Ask", "Translate", "Compare", "Anchor",
-#   "Save", "Capture".
-VOICE_INTENT_PROMPT = """\
-You classify a voice command spoken by a user wearing an XR headset. The
-user is looking at a real-world object and may want to do one of the
-following seven actions with it. Return EXACTLY the canonical intent name.
-
-===== Canonical intents =====
-1. "Search" -- The user wants factual info / description of the
-   object they are looking at. Typical phrasings: "what is this?", "tell me
-   about this", "이거 뭐야?", "이게 뭔지 알려줘", "설명해줘".
-2. "Translate" -- The user wants text visible on/near the target translated.
-   Phrasings: "translate this", "이거 번역해줘", "read this in English".
-3. "Compare" -- The user wants two visible objects compared. Phrasings:
-   "compare these", "which one is better?", "이거랑 저거 비교해줘",
-   "둘 중 뭐가 나아?".
-4. "Anchor" -- The user wants a spatial anchor / pin dropped on the target
-   so they can find it again later. Phrasings: "anchor this", "pin this
-   here", "여기 표시해줘", "위치 저장해".
-5. "Save" -- The user wants to attach a note / bookmark to the object.
-   Phrasings: "save this", "note this", "이거 메모해줘", "북마크".
-6. "Capture" -- The user wants to photograph / capture the target.
-   Phrasings: "take a picture of this", "capture this", "찍어줘",
-   "사진 저장".
-7. "Ask" -- ANY open-ended question that does not clearly fit the six
-   above. This is the fallback bucket. Phrasings: "how do I use this?",
-   "how much is it?", "이거 어떻게 써?", "얼마야?", "누가 만들었어?".
-
-===== Classification rules =====
-- Prefer one of the first six intents when the phrasing clearly matches.
-- If in doubt, choose "Ask". A study participant should never see a
-  mis-routed card just because the intent classifier was overconfident.
-- Answer in the SAME language the user spoke is NOT required here -- this
-  is a machine-readable classification, so intent must be the exact
-  canonical English string above.
-
-===== Save-specific extraction =====
-When and ONLY when the classified intent is "Save", also extract the note
-body from the transcript into a `note_content` field. Users often speak
-the note inline, e.g. "메모에 '내일 3시 회의' 라고 저장해줘" or
-"save a note that says buy milk". The note body is the actual content the
-user wants written on the sticky note -- NOT the wrapping command words.
-Guidelines:
-- Strip the wrapping verbs ("save", "note", "메모해줘", "저장해줘") and
-  the framing quotes ("라고", "as", "that says").
-- Preserve the note body in the user's original language.
-- If the transcript is a Save intent but has no clear note body (e.g. the
-  user just said "save this"), return an empty string for note_content --
-  the downstream flow will fall back to opening the manual input UI.
-- For every non-Save intent, omit `note_content` entirely (or leave it "").
-
-===== Output format (STRICT) =====
-Return EXACTLY one JSON object, no prose:
-
-{
-  "intent":       "<one of the seven canonical strings above>",
-  "confidence":   "high" | "medium" | "low",
-  "rationale":    "<brief English explanation, one short sentence>",
-  "note_content": "<Save intent only: the extracted note body, else empty string>"
-}
-
-===== User transcript =====
-"{transcript}"
-"""
-
-
-# DEPRECATED as of the 7-referent voice routing refactor. Voice queries now
-# go through voice_pipeline.dispatch(), which classifies the transcript with
-# VOICE_INTENT_PROMPT above and reuses the same YOLO+CLIP+DB handler as the
-# gesture path. For open-ended Ask fallback the handler chain uses
-# ASK_REFERENCE_PROMPT (see top of file).
+#   "Search", "Ask", "Translate", "Compare", "Anchor", "Save", "Capture".
 #
-# Kept here because it captures the GazePointAR Figure 8 structure with an
-# explicit gaze coordinate injection, which is a useful reference if we ever
-# want to run a single-call multimodal Voice mode again (e.g. for baseline
-# comparison in a follow-up study). Not imported anywhere at runtime.
+# Filled via str.replace (NOT str.format -- the JSON braces below would
+# break format()): {transcript}, {gaze_info}, {db_info}.
 VOICE_COMMAND_PROMPT = """\
 You are a context-aware voice assistant for a user wearing an XR headset. The
 image below is a snapshot of the user's real-world field of view (passthrough
-camera + Unity overlays) captured the moment their speech was recognized.
+camera of headset) captured the moment their spoken question ended.
 Treat pronouns in the query (this, that, here, there, it, they, 이것, 저것,
 여기, 저기 등) as pointers to something visible in that image.
 
-===== 1. User query (verbatim) =====
+===== 1. User query =====
 The user asked: "{transcript}"
 
-===== 2. Where the user was LOOKING (gaze target) =====
+===== 2. Where the user was LOOKING when the question ended (gaze target) =====
 {gaze_info}
 
-===== 3. Where the user is POINTING (secondary cue) =====
-Inspect the frame for a visible hand, extended finger, or hand-held pointer.
-If one is present and clearly aimed at an object, treat that object as the
-referent instead of the gaze target -- explicit pointing outranks gaze. If
-no pointing gesture is visible, ignore this section and rely on the gaze
-target above.
+===== 3. Identified object at the gaze (database lookup) =====
+{db_info}
 
 ===== 4. Other objects in view (peripheral context) =====
-Everything else visible in the frame (background objects, text, signage,
-overlays) may still matter for questions like "what else is here?" or
-"which of these ...?", but weight it below the gaze / pointing target when
+Everything else visible in the frame (background objects, text)
+may still matter for questions like "what else is here?" or
+"which of these ...?", but weight it below the gaze target when
 resolving a specific referent.
 
-===== 5. Answer this question =====
-"{transcript}"
+===== 5. Classify the user's intent =====
+Decide which ONE of the seven canonical actions the user wants done with the
+resolved referent. This decides which result card the headset shows, so the
+intent must be the EXACT canonical English string:
+1. "Search" -- factual info / description of the target. "what is this?",
+   "tell me about this", "이거 뭐야?", "설명해줘".
+2. "Translate" -- translate text visible on/near the target. "translate
+   this", "이거 번역해줘/해석해줘".
+3. "Compare" -- compare two visible objects. "which one is better?",
+   "이거랑 저거 비교해줘".
+4. "Anchor" -- drop a spatial pin on the target to log the position. "pin this
+   here", "여기 표시해줘", "위치 저장해".
+5. "Save" -- attach or write a note to the target. "note this", "이거 메모해줘".
+6. "Capture" -- photograph / capture the target. "take a picture of this",
+   "찍어줘", "사진 저장".
+7. "Ask" -- ANY open-ended question that does not clearly fit the six above.
+   This is the fallback bucket: when in doubt, choose "Ask".
 
 ===== 6. Output format (STRICT) =====
 Respond with EXACTLY one JSON object, no prose before or after:
 
 {
-  "name":       "<short label for the resolved target or task>",
-  "referent":   "<what you resolved any pronoun to, grounded in the gaze/pointing target, e.g. 'the blue soda can at the gaze pixel'; empty string if the query had no pronoun>",
-  "answer":     "<ONE natural sentence that directly answers the user, followed by a short justification clause>",
-  "confidence": "high" | "medium" | "low"
+  "intent":       "Search" | "Translate" | "Compare" | "Anchor" | "Save" | "Capture" | "Ask",
+  "name":         "<short label for the resolved target or task>",
+  "answer":       "<ONE natural sentence that directly answers the user, followed by a short justification clause>",
+  "note_content": "<Save intent only: the note body spoken inline (wrapping verbs like 'save'/'메모해줘' and framing quotes like '라고'/'that says' stripped, original language preserved); empty string otherwise or when Save has no clear note body>"
 }
 
 ===== 7. Answering rules =====
 - Answer in the SAME language the user spoke (Korean transcript -> Korean
-  answer; English transcript -> English answer).
+  answer; English transcript -> English answer). "intent" stays the exact
+  canonical English string regardless of language.
+- When section 3 contains a database match, treat its fields as
+  AUTHORITATIVE ground truth about the gaze target: use the DB name as
+  "name", answer factual questions (price, capacity, origin, printed
+  text, translation) from the DB fields FIRST, and only fall back to the
+  image for things the DB does not cover. Do NOT contradict the DB.
+- When section 3 reports no match, identify the referent from the image
+  alone, exactly as before.
 - Keep the tone natural and conversational, like answering a curious friend.
 - The "answer" field must be a single sentence. Include a short "because ..."
   or "-- <reason>" clause so the user understands why.
 - Ground your answer in what is actually visible AT OR NEAR the gaze pixel
   first. Do NOT invent objects that are not in the frame.
-- If the object at the gaze target is unclear, admit it in "answer", set
-  "confidence" to "low", and describe what IS at that pixel neighbourhood so
-  the user can tell whether the tracker mis-aimed.
+- If the object at the gaze target is unclear, admit it in "answer" and
+  describe what IS at that pixel neighbourhood so the user can tell whether
+  the tracker mis-aimed.
 - Even with missing info or an ambiguous referent, DO NOT refuse. Give your
-  best estimate or a range and set "confidence" to "low".
+  best estimate or a range.
 - If the query has no pronoun and does not refer to the visible scene at
   all (e.g. a general knowledge question), still answer using the same
-  format, leave "referent" empty, and set "confidence" based on how sure you
-  are of the general answer.
+  format and classify the intent from the wording alone (usually "Ask").
 """

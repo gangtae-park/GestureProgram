@@ -1,19 +1,19 @@
-"""Gesture-driven VLM pipeline package.
+"""Gesture-driven VLM pipeline package, organized by role:
 
-Public modules (import as `from vlm_pipeline import <module>`):
-  - config       : all tunable constants (network, models, prompt)
-  - state        : process-wide shared state + locks
-  - geometry     : projection / bbox / IoU helpers
-  - ridge        : gaze direction -> normalized screen coords
-  - segmentation : YOLO segmentation backend
-  - clip_matcher : CLIP image embedding + cosine match against object DB
-  - object_db    : fixed 3-object DB (metadata + cached CLIP embeddings)
-  - ocr          : EasyOCR wrapper with ROI + paragraph mode
-  - vlm_client   : OpenAI client (translation + Ask follow-ups + Whisper)
-  - network      : packet parsing, ADB stream thread, UDP receive thread,
-                   Python -> Unity UDP sender
-  - render       : drawing utilities (overlays, placeholder canvas)
-  - handlers     : per-gesture handler registry + dispatch_gesture()
+  - config, state : tunable constants / process-wide shared state (top level,
+                    imported by every subpackage)
+  - gaze/         : gaze direction -> screen coords, calibration, head comp
+  - vision/       : YOLO/YOLOE segmentation, CLIP matching, object DB,
+                    metric depth, target anchors, OCR
+  - llm/          : OpenAI client (translation, Ask follow-ups, streaming)
+  - voice/        : voice-command HTTP ingress + GazePointAR-style single-call
+                    routing (frame + gaze + query -> one multimodal GPT call)
+  - unity/        : ADB stream + UDP comms with Unity, Unity-triggered actions
+  - ui/           : OpenCV drawing helpers for the Mac window
+  - handlers/     : per-gesture handler registry + dispatch_gesture()
 
-Entry point lives at /MacProgram/gesture_vlm.py and just wires these together.
+Import as `from vlm_pipeline.<subpackage> import <module>`, e.g.
+`from vlm_pipeline.vision import segmentation`.
+
+Entry point lives at /MacProgram/app.py and just wires these together.
 """

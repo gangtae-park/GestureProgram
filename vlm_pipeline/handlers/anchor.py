@@ -1,19 +1,23 @@
-"""Handler for the 'Anchor' gesture.
+"""
+Handler for the 'Anchor' gesture.
 
 Pipeline:
-  1. gaze bbox from the gesture's gaze points.
+  1. Draw gaze bbox.
   2. YOLO segment whose bbox best overlaps the gaze bbox.
-  3. CLIP-embed the (masked) crop, look it up in the 3-object DB.
+  3. CLIP-embed the crop, look it up in the DB.
   4. If the match clears CLIP_MATCH_MIN_SCORE, send an ack VLM_RESULT with the
-     matched object name so Unity can place its anchor. Below threshold (or
-     YOLO finds nothing) -> gesture fail.
+     matched object name so Unity can place its anchor.
 """
 from datetime import datetime
 
 import cv2
 import numpy as np
 
-from .. import clip_matcher, config, geometry, network, render, segmentation, target_anchor
+from .. import config
+from ..gaze import geometry
+from ..ui import render
+from ..unity import network
+from ..vision import clip_matcher, segmentation, target_anchor
 from . import register
 
 
@@ -80,7 +84,7 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
             target_meta={"gaze_bbox": list(gaze_bbox)},
         )
 
-    # ---- CLIP query crop (masked when possible) ----
+    # ---- CLIP query crop ----
     try:
         clip_crop = clip_matcher.prepare_query_crop(target, captured_frame)
     except Exception as exc:

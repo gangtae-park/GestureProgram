@@ -1,286 +1,239 @@
-"""Handler for the 'Translate' gesture (two-stage).
+"""Handler for the 'Translate' gesture -- DB-based study version.
 
-Stage 1 -- on Translate READY (fires when Jackknife recognises the pose,
-before the user has confirmed):
-  do_ocr() builds the gaze bbox, runs OCR over a padded ROI, picks the
-  paragraph closest to / containing the gaze, and sends a partial VLM_RESULT
-  to Unity with the recognised text (no translation yet). The chosen text +
-  metadata is cached in state.latest_translate_pending for stage 2.
+CHI 2027 study version -- no OCR, no GPT. Mirrors Search: YOLO picks the
+document-like object under gaze (document / name card / ...), CLIP matches it
+against object_db, and the pre-authored source text + translation stored in
+objects.json ship straight to Unity. OCR + live GPT translation is a
+variability confound the study design excludes; the old OCR+GPT handler
+lives in git history if the real-world path is ever needed again.
 
-Stage 2 -- on Translate END (fires when the user confirms with a palm-forward
-swipe):
-  handle() pulls the cached OCR result and runs GPT translation. Sends the
-  final VLM_RESULT with both the original text and the Korean translation.
+objects.json fields consumed here (per object):
+  "text_original":    the text printed on the physical document, verbatim.
+  "result_translate": the pre-authored translation to display.
 
-Splitting like this lets Unity show the OCR'd text immediately so the user
-can see WHAT will be translated before committing to the (slower) GPT call.
+Unity contract is unchanged from the OCR version, so no Unity edits needed:
+  packet 1: stage='ocr' VLM_RESULT with response.name = source text and an
+            empty translation (Unity shows the source + "translating...")
+  packet 2: one stream delta + a stream end carrying the full translation
+            (Unity swaps the placeholder for the final text).
 """
-import time
+import json
+import os
+import threading
 import uuid
 from datetime import datetime
 
 import cv2
 import numpy as np
 
-from .. import config, geometry, network, ocr, render, state, target_anchor
-from ..vlm_client import translate_text_to_korean_stream
+from .. import config
+from ..gaze import geometry
+from ..ui import render
+from ..unity import network
+from ..vision import clip_matcher, segmentation, target_anchor
 from . import register
 
 
-PENDING_TTL_SEC = 30.0  # cached OCR result expires this many seconds after READY
-
-
-def _pick_block_for_gaze(blocks, gaze_bbox):
-    """Return (index, "overlap" | "nearest", iou_or_distance). Falls back to
-    the nearest block when nothing overlaps; returns (-1, None, 0) if blocks
-    is empty.
-    """
-    if not blocks:
-        return -1, None, 0.0
-
-    best_overlap_idx, best_overlap = -1, 0.0
-    for i, b in enumerate(blocks):
-        iou = geometry.bbox_iou(gaze_bbox, b["bbox"])
-        if iou > best_overlap:
-            best_overlap = iou
-            best_overlap_idx = i
-    if best_overlap_idx >= 0:
-        return best_overlap_idx, "overlap", best_overlap
-
-    # No overlap -- pick whichever block's centre is closest to gaze centre.
-    gcx = (gaze_bbox[0] + gaze_bbox[2]) / 2.0
-    gcy = (gaze_bbox[1] + gaze_bbox[3]) / 2.0
-    best_dist = float("inf")
-    best_idx = -1
-    for i, b in enumerate(blocks):
-        bx1, by1, bx2, by2 = b["bbox"]
-        bcx = (bx1 + bx2) / 2.0
-        bcy = (by1 + by2) / 2.0
-        d = (bcx - gcx) ** 2 + (bcy - gcy) ** 2
-        if d < best_dist:
-            best_dist = d
-            best_idx = i
-    return best_idx, "nearest", float(best_dist ** 0.5)
-
-
-def do_ocr(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.ndarray:
-    """Stage 1 -- called from network.py on Translate READY. OCR only; caches
-    the chosen text in state.latest_translate_pending for the END stage."""
-    if captured_frame is None:
-        print("[Translate][OCR] no captured frame at READY")
-        with state.translate_lock: state.latest_translate_pending = None
-        return render.placeholder_canvas("No frame at Translate READY")
-
-    pixel_points = geometry.project_norm_points(norm_points, captured_frame.shape)
-    gaze_bbox = geometry.compute_gaze_bbox(pixel_points, captured_frame.shape)
-
-    h, w = captured_frame.shape[:2]
-    print(
-        f"[Translate][OCR] READY | frame={w}x{h} | "
-        f"gaze_points={len(pixel_points)} | gaze_bbox={gaze_bbox}"
-    )
-
-    if gaze_bbox is None:
-        with state.translate_lock: state.latest_translate_pending = None
-        overlay = render.render_target_overlay(
-            captured_frame, pixel_points, None, None, "NONE", [], gesture_name
-        )
-        cv2.putText(
-            overlay, f"NOT ENOUGH GAZE POINTS ({len(pixel_points)})",
-            (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, config.TRAIL_COLOR, 2, cv2.LINE_AA,
-        )
-        _send_ocr_fail(gesture_name, "Not enough gaze points.")
-        return overlay
-
-    ocr_blocks = ocr.run_ocr_in_roi(captured_frame, gaze_bbox=gaze_bbox)
-    print(f"[Translate][OCR] detected {len(ocr_blocks)} paragraph blocks")
-
-    overlay = render.render_target_overlay(
-        captured_frame, pixel_points, gaze_bbox,
-        None, "NONE", [], gesture_name,
-    )
-    for b in ocr_blocks:
-        x1, y1, x2, y2 = b["bbox"]
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (120, 120, 120), 1)
-
-    idx, pick_mode, pick_score = _pick_block_for_gaze(ocr_blocks, gaze_bbox)
-    if idx < 0:
-        with state.translate_lock: state.latest_translate_pending = None
-        cv2.putText(
-            overlay, "TRANSLATE: no OCR text near gaze",
-            (20, overlay.shape[0] - 30),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 220, 255), 2, cv2.LINE_AA,
-        )
-        _send_ocr_fail(gesture_name, "No OCR text near gaze.")
-        return overlay
-
-    chosen = ocr_blocks[idx]
-    print(
-        f"[Translate][OCR] picked via {pick_mode} ({pick_score:.3f}) | "
-        f"bbox={chosen['bbox']} text={chosen['text']!r}"
-    )
-
-    x1, y1, x2, y2 = chosen["bbox"]
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
-    label = chosen["text"]
-    if len(label) > 60:
-        label = label[:57] + "..."
-    cv2.putText(
-        overlay, label, (x1, max(0, y1 - 6)),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA,
-    )
-
-    # Translate has no YOLO mask -- use bbox-only depth via target_anchor.
-    translate_anchor = target_anchor.compute(captured_frame, list(chosen["bbox"]), None)
-
-    # Cache for stage 2.
-    with state.translate_lock:
-        state.latest_translate_pending = {
-            "text": chosen["text"],
-            "bbox": list(chosen["bbox"]),
-            "gaze_bbox": list(gaze_bbox),
-            "pick_mode": pick_mode,
-            "pick_score": float(pick_score),
-            "timestamp": time.time(),
-            "anchor": translate_anchor,
-        }
-
-    ocr_response = {
-        "name": chosen["text"],
-        "translation": "",
+def _persist(crop_bgr, target_meta, match_meta, payload):
+    """Audit trail in vlm_outputs/, same shape as Search's."""
+    os.makedirs(config.VLM_OUTPUT_DIR, exist_ok=True)
+    timestamp = payload.get("timestamp") or datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    base = os.path.join(config.VLM_OUTPUT_DIR, f"{timestamp}_Translate")
+    log = {
+        "timestamp": timestamp,
+        "gesture": "Translate",
+        "model": f"YOLO+CLIP({config.CLIP_MODEL_NAME})",
+        "target_meta": target_meta,
+        "match_meta": match_meta,
+        "payload": payload,
     }
-    target_anchor.merge_into_response(ocr_response, translate_anchor)
+    with open(base + ".json", "w", encoding="utf-8") as f:
+        json.dump(log, f, indent=2, ensure_ascii=False)
+    try:
+        cv2.imwrite(base + ".png", crop_bgr)
+    except Exception as exc:
+        print(f"[Translate][WARN] crop save failed: {exc}")
+    print(f"[Translate] saved -> {base}.json")
 
-    # Send partial result to Unity: source text, no translation yet.
-    payload = {
+
+def _fail(gesture_name, reason, extra=None):
+    payload_extra = dict(extra or {})
+    payload_extra["stage"] = "translation"
+    network.send_gesture_fail_to_unity(gesture_name, reason, payload_extra)
+    print(f"[Translate] gesture fail | {reason}")
+
+
+def _match_worker(crop_bgr, target_meta, gesture_name, anchor=None):
+    """CLIP match -> DB translate fields -> the two-packet Unity sequence."""
+    matched_obj, match_meta = clip_matcher.resolve_db_match(crop_bgr)
+
+    if matched_obj is None:
+        reason = clip_matcher.fail_reason_for(match_meta["status"], match_meta)
+        fail_payload = {
+            "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3],
+            "gesture": gesture_name,
+            "model": f"YOLO+CLIP({config.CLIP_MODEL_NAME})",
+            "status": "fail",
+            "stage": "translation",
+            "reason": reason,
+            "target_meta": target_meta,
+            "response": {"error": reason},
+        }
+        _persist(crop_bgr, target_meta, match_meta, fail_payload)
+        network.send_vlm_result_to_unity(fail_payload)
+        print(f"[Translate] gesture fail | {match_meta['status']} | {reason}")
+        return
+
+    text_original = str(matched_obj.get("text_original") or "").strip()
+    translation = str(matched_obj.get("result_translate") or "").strip()
+    if not text_original or not translation:
+        _fail(
+            gesture_name,
+            f"DB object {matched_obj['id']!r} has no translate fields "
+            f"(text_original / result_translate).",
+        )
+        return
+
+    print(
+        f"[Translate] matched id={matched_obj['id']} score={match_meta['score']:.3f} "
+        f"name={matched_obj.get('name')!r}"
+    )
+
+    # ---- packet 1: source text (Unity shows it with a placeholder) ----
+    ocr_response = {"name": text_original, "translation": ""}
+    target_anchor.merge_into_response(ocr_response, anchor or {})
+    ocr_stage_payload = {
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3],
         "gesture": gesture_name,
         "stage": "ocr",
-        "model": "EasyOCR",
+        "model": f"YOLO+CLIP({config.CLIP_MODEL_NAME})",
         "status": "ok",
-        "target_meta": {
-            "source": "OCR",
-            "bbox": list(chosen["bbox"]),
-            "pick_mode": pick_mode,
-            "pick_score": float(pick_score),
-            "gaze_bbox": list(gaze_bbox),
-        },
+        "target_meta": target_meta,
+        "match_meta": match_meta,
         "response": ocr_response,
     }
-    network.send_vlm_result_to_unity(payload)
+    network.send_vlm_result_to_unity(ocr_stage_payload)
 
-    cv2.putText(
-        overlay, f"OCR ready [{pick_mode}] -- swipe to translate",
-        (20, overlay.shape[0] - 30),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 220, 255), 2, cv2.LINE_AA,
-    )
-    return overlay
-
-
-@register("Translate")
-def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.ndarray:
-    """Called on Translate END. Since the palm-swipe confirmation step was
-    removed for usability, Translate now fires END the moment Jackknife
-    matches -- there's no separate READY event anymore.
-
-    If no OCR result is cached (the normal case now), we run the OCR pass
-    inline right here, then run the GPT translation. Unity's SpawnTranslateResult
-    handles both stages: it shows the OCR text with a "translating..." placeholder
-    on the first packet and swaps in the Korean translation on the second."""
-    overlay = (
-        render.placeholder_canvas("Translate END")
-        if captured_frame is None else captured_frame.copy()
-    )
-
-    with state.translate_lock:
-        cached = state.latest_translate_pending
-        state.latest_translate_pending = None
-
-    if cached is None:
-        # Run OCR inline; do_ocr populates state.latest_translate_pending and
-        # emits an intermediate stage='ocr' VLM_RESULT so Unity's card can show
-        # the source text immediately.
-        print("[Translate] END with no cached OCR (post-swipe-removal path); running OCR inline.")
-        do_ocr(captured_frame, norm_points, gesture_name)
-        with state.translate_lock:
-            cached = state.latest_translate_pending
-            state.latest_translate_pending = None
-
-    if cached is None:
-        # OCR failed to find usable text; do_ocr already sent a fail packet.
-        print("[Translate] inline OCR produced no usable text; giving up.")
-        cv2.putText(
-            overlay, "TRANSLATE FAIL: no OCR text",
-            (20, overlay.shape[0] - 30),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA,
-        )
-        return overlay
-
-    age = time.time() - cached.get("timestamp", 0)
-    if age > PENDING_TTL_SEC:
-        reason = f"cached OCR is stale ({age:.1f}s old)"
-        print(f"[Translate] END but {reason}")
-        network.send_gesture_fail_to_unity(gesture_name, reason, {"stage": "translation"})
-        return overlay
-
-    text = cached["text"]
+    # ---- packet 2: the stored translation via the stream channel Unity
+    # already understands (one delta with the full text, then the end) ----
     stream_id = uuid.uuid4().hex
-    target_meta = {
-        "source": "OCR",
-        "bbox": cached["bbox"],
-        "pick_mode": cached["pick_mode"],
-        "pick_score": cached["pick_score"],
-        "gaze_bbox": cached["gaze_bbox"],
-    }
-    seq_counter = [0]
-
-    def _on_delta(chunk: str) -> None:
-        # First delta carries target_meta so Unity has enough context if the
-        # OCR-stage packet was somehow missed; subsequent deltas skip it to
-        # keep bytes down.
-        tm = target_meta if seq_counter[0] == 0 else None
-        network.send_stream_delta_to_unity(
-            stream_id=stream_id,
-            gesture=gesture_name,
-            delta=chunk,
-            stage="translation",
-            seq=seq_counter[0],
-            target_meta=tm,
-        )
-        seq_counter[0] += 1
-
-    ko = translate_text_to_korean_stream(text, _on_delta)
-
-    print("[Translate] === translation result (streamed) ===")
-    print(f"  EN: {text}")
-    print(f"  KO: {ko}")
-    print("[Translate] ===================================")
-
-    translation_response = {
-        "name": text,
-        "translation": ko,
-    }
-    # Reuse the anchor cached at READY so the translation card lands at the
-    # same world position as the OCR preview did.
-    target_anchor.merge_into_response(translation_response, cached.get("anchor") or {})
-
+    network.send_stream_delta_to_unity(
+        stream_id=stream_id,
+        gesture=gesture_name,
+        delta=translation,
+        stage="translation",
+        seq=0,
+        target_meta=target_meta,
+    )
+    translation_response = {"name": text_original, "translation": translation}
+    target_anchor.merge_into_response(translation_response, anchor or {})
     network.send_stream_end_to_unity(
         stream_id=stream_id,
         gesture=gesture_name,
         stage="translation",
-        status="ok" if ko else "fail",
+        status="ok",
         response=translation_response,
         target_meta=target_meta,
-        error="" if ko else "empty_translation",
+        error="",
     )
 
+    final_payload = dict(ocr_stage_payload)
+    final_payload["stage"] = "translation"
+    final_payload["response"] = translation_response
+    _persist(crop_bgr, target_meta, match_meta, final_payload)
+
+
+@register("Translate")
+def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.ndarray:
+    """Called on Translate END. Same target selection as Search: gaze bbox ->
+    YOLO overlap -> masked CLIP crop -> DB match, then the stored translation
+    ships to Unity."""
+    if captured_frame is None:
+        return render.placeholder_canvas("No frame at gesture END")
+
+    pixel_points = geometry.project_norm_points(norm_points, captured_frame.shape)
+    gaze_bbox = geometry.compute_gaze_bbox(pixel_points, captured_frame.shape)
+
+    if gaze_bbox is None:
+        empty = render.render_target_overlay(
+            captured_frame, pixel_points, None, None, "NONE", [], gesture_name
+        )
+        cv2.putText(
+            empty, f"NOT ENOUGH GAZE POINTS ({len(pixel_points)})",
+            (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, config.TRAIL_COLOR, 2, cv2.LINE_AA,
+        )
+        _fail(gesture_name, "Not enough gaze points.")
+        return empty
+
+    # ---- YOLO segment selection (documents come in as e.g. 'document') ----
+    yolo_items = segmentation.run_yolo(captured_frame)
+    target = None
+    target_source = "NONE"
+
+    if yolo_items:
+        idx, overlap, iou = geometry.pick_best_overlap(gaze_bbox, yolo_items)
+        if idx >= 0 and overlap > 0:
+            chosen = dict(yolo_items[idx])
+            chosen["best_overlap"] = overlap
+            chosen["best_iou"] = iou
+            target = chosen
+            target_source = "YOLO"
+            print(
+                f"[Translate][YOLO] target | class={chosen['class_name']} "
+                f"conf={chosen['conf']:.2f} overlap={overlap:.2f} iou={iou:.2f} "
+                f"bbox={chosen['bbox']}"
+            )
+
+    overlay = render.render_target_overlay(
+        captured_frame, pixel_points, gaze_bbox,
+        target, target_source, yolo_items, gesture_name,
+    )
+
+    if target is None:
+        cv2.putText(
+            overlay, "NO TARGET (no YOLO segment overlaps gaze)",
+            (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, config.TRAIL_COLOR, 2, cv2.LINE_AA,
+        )
+        _fail(gesture_name, "No YOLO segment overlaps gaze.")
+        return overlay
+
+    # ---- CLIP query crop -- masked when available ----
+    try:
+        crop_for_clip = clip_matcher.prepare_query_crop(target, captured_frame)
+    except Exception as exc:
+        print(f"[Translate][ERROR] prepare_query_crop failed: {exc}")
+        cv2.putText(
+            overlay, f"CROP ERROR: {exc}",
+            (20, overlay.shape[0] - 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA,
+        )
+        _fail(gesture_name, f"CROP ERROR: {exc}")
+        return overlay
+
+    target_meta = {
+        "source": target_source,
+        "bbox": list(target["bbox"]),
+        "best_overlap": float(target.get("best_overlap", 0.0)),
+        "best_iou": float(target.get("best_iou", 0.0)),
+        "class_name": target.get("class_name"),
+        "conf": float(target.get("conf", 0.0)) if "conf" in target else None,
+        "gaze_bbox": list(gaze_bbox),
+        "clip_masked_crop": bool(
+            config.CLIP_USE_MASKED_CROP and target.get("mask_bool") is not None
+        ),
+    }
+
+    anchor = target_anchor.compute(captured_frame, target.get("bbox"), target.get("mask_bool"))
+
+    threading.Thread(
+        target=_match_worker,
+        args=(crop_for_clip, target_meta, gesture_name, anchor),
+        daemon=True,
+    ).start()
+
     cv2.putText(
-        overlay, f"TRANSLATE streamed -> Unity (EN '{text[:30]}...' -> KO)",
+        overlay, "TRANSLATE: matching against DB...",
         (20, overlay.shape[0] - 30),
         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 220, 255), 2, cv2.LINE_AA,
     )
     return overlay
-
-
-def _send_ocr_fail(gesture_name, reason):
-    network.send_gesture_fail_to_unity(gesture_name, reason, {"stage": "ocr"})

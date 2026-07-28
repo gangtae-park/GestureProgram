@@ -19,15 +19,11 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from .. import (
-    clip_matcher,
-    config,
-    geometry,
-    network,
-    render,
-    segmentation,
-    target_anchor,
-)
+from .. import config
+from ..gaze import geometry
+from ..ui import render
+from ..unity import network
+from ..vision import clip_matcher, segmentation, target_anchor
 from . import register
 
 

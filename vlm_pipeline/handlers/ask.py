@@ -1,18 +1,17 @@
-"""Handler for the 'Ask' gesture (question-mark shape).
+"""
+Handler for the 'Ask' gesture.
 
 Pipeline (two phases, two Unity messages):
 
   PHASE 1 -- triggered by gesture END:
     a. gaze bbox -> YOLO -> masked crop.
-    b. CLIP match against the 3-object DB.
-       * Below threshold       -> gesture fail (Unity gets fail VLM_RESULT).
+    b. CLIP match against the DB.
     c. Cache crop + matched object in state.latest_ask_target.
-    d. Send VLM_RESULT with stage='object_recognized' + the DB name so Unity
-       can immediately prompt the user with "I see <name>, what do you want
-       to ask?".
+    d. Send VLM_RESULT with stage='object_recognized' + the DB name.
 
-  PHASE 2 -- triggered later, when Unity POSTs the recorded audio:
-    a. voice_server -> Whisper transcribe -> network.process_ask_question.
+  PHASE 2 -- triggered later, when the headset POSTs the on-device STT
+  transcript to voice_server's /ask_voice endpoint:
+    a. voice_server -> network.process_ask_question(transcript).
     b. process_ask_question pulls the cached match + crop, calls GPT with the
        DB info as ground truth, and sends VLM_RESULT with stage='answer'
        carrying both the DB name and the GPT answer.
@@ -23,16 +22,11 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from .. import (
-    clip_matcher,
-    config,
-    geometry,
-    network,
-    render,
-    segmentation,
-    state,
-    target_anchor,
-)
+from .. import config, state
+from ..gaze import geometry
+from ..ui import render
+from ..unity import network
+from ..vision import clip_matcher, segmentation, target_anchor
 from . import register
 
 
@@ -103,7 +97,7 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
             target_meta={"gaze_bbox": list(gaze_bbox)},
         )
 
-    # ---- CLIP query crop (masked when possible) ----
+    # ---- CLIP query crop ----
     try:
         clip_crop = clip_matcher.prepare_query_crop(target, captured_frame)
     except Exception as exc:
@@ -114,7 +108,7 @@ def handle(captured_frame: np.ndarray, norm_points, gesture_name: str) -> np.nda
 
     matched_obj, match_meta = clip_matcher.resolve_db_match(clip_crop)
 
-    # ---- Crop we keep for the GPT call (uses padded bbox like before) ----
+    # ---- Crop we keep for the GPT call ----
     crop_x1, crop_y1, crop_x2, crop_y2 = geometry.expand_bbox_for_crop(
         target["bbox"], captured_frame.shape, config.TARGET_CROP_PAD_RATIO
     )
